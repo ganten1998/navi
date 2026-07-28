@@ -56,6 +56,7 @@ pub struct NaviApp {
 
     search_active: bool,
     search_query: String,
+    search_swallow_slash: bool,
 
     help_anim: f32,
     help_visible: bool,
@@ -78,6 +79,14 @@ pub struct NaviApp {
 
     // Cached graph_rect from last frame for coordinate math during input
     graph_rect: Rect,
+    // The pre-frame fit in new() assumes a 1400×870 viewport; tiling WMs
+    // (i3, AeroSpace) hand us an arbitrary size on map, so we re-fit once we
+    // see the real rect.
+    initial_fit_done: bool,
+
+    // Q/Escape sets this; main.rs routes it through event_loop.exit() so GL
+    // teardown runs (a raw process::exit skips Drop and can upset drivers).
+    quit_requested: bool,
 }
 
 impl NaviApp {
@@ -117,6 +126,7 @@ impl NaviApp {
             popup: None,
             search_active: false,
             search_query: String::new(),
+            search_swallow_slash: false,
             help_anim: 0.0,
             help_visible: false,
             status_msg: None,
@@ -138,6 +148,8 @@ impl NaviApp {
             now_secs:            unix_now(),
             physics_accumulator: 0.0,
             graph_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 870.0)),
+            initial_fit_done: false,
+            quit_requested: false,
         };
         // positions_disk() already pre-relaxes internally, so nodes are at
         // equilibrium.  Resume physics with an ease-in so nothing snaps.
@@ -192,7 +204,9 @@ impl NaviApp {
         let pad = navi_core::graph::R_MAX * 3.0;
         let world_w = (max_x - min_x + pad * 2.0).max(1.0);
         let world_h = (max_y - min_y + pad * 2.0).max(1.0);
-        self.zoom = ((1400.0 / world_w).min(870.0 / world_h) * 0.70).clamp(ZOOM_MIN, ZOOM_MAX);
+        let vw = self.graph_rect.width().max(1.0);
+        let vh = self.graph_rect.height().max(1.0);
+        self.zoom = ((vw / world_w).min(vh / world_h) * 0.70).clamp(ZOOM_MIN, ZOOM_MAX);
         let cx = (min_x + max_x) / 2.0;
         let cy = (min_y + max_y) / 2.0;
         self.pan = Vec2::new(-cx * self.zoom, -cy * self.zoom);
@@ -260,6 +274,12 @@ impl NaviApp {
         self.status_msg = Some((msg, Instant::now(), dur));
     }
 
+    /// Shown when main() couldn't load the org-roam db: the window still opens
+    /// (empty graph) with this pinned in the status bar until a reload succeeds.
+    pub fn set_startup_error(&mut self, msg: String) {
+        self.set_msg(msg, Duration::from_secs(24 * 3600));
+    }
+
     fn search_commit(&mut self) {
         let q = self.search_query.to_lowercase();
         if q.is_empty() { self.search_query.clear(); return; }
@@ -305,7 +325,9 @@ impl NaviApp {
         let pad     = navi_core::graph::R_MAX * 4.0;
         let world_w = (max_x - min_x + pad * 2.0).max(1.0);
         let world_h = (max_y - min_y + pad * 2.0).max(1.0);
-        self.zoom = ((1400.0 / world_w).min(870.0 / world_h) * 0.72).clamp(ZOOM_MIN, ZOOM_MAX);
+        let vw = self.graph_rect.width().max(1.0);
+        let vh = self.graph_rect.height().max(1.0);
+        self.zoom = ((vw / world_w).min(vh / world_h) * 0.72).clamp(ZOOM_MIN, ZOOM_MAX);
         let cx = (min_x + max_x) / 2.0;
         let cy = (min_y + max_y) / 2.0;
         self.pan = Vec2::new(-cx * self.zoom, -cy * self.zoom);
@@ -360,7 +382,9 @@ impl NaviApp {
             || self.pan_vel.length() > 0.5
             || self.node_dragging.is_some()
             || (self.help_anim - if self.help_visible { 1.0 } else { 0.0 }).abs() > 0.01
-            || self.status_msg.as_ref().map_or(false, |(_, t, d)| t.elapsed() < *d)
+            // Cap at 6 s so a long-lived (pinned) status message doesn't hold
+            // the renderer at full speed for its whole lifetime.
+            || self.status_msg.as_ref().map_or(false, |(_, t, d)| t.elapsed() < (*d).min(Duration::from_secs(6)))
             || self.reload_pending.is_some()
     }
 
@@ -382,7 +406,9 @@ impl NaviApp {
         if let Some(sel) = &self.selected {
             if let Some(&idx) = self.graph.nodes.get(sel) {
                 let title = &self.graph.node_list[idx].title;
-                let t = if title.len() > 52 { &title[..52] } else { title.as_str() };
+                // char-based truncation — byte slicing panics mid-codepoint on
+                // CJK titles
+                let t: String = title.chars().take(52).collect();
                 return format!("  {t}  ·  {n} Nodes  ·  {e} Edges{filt}");
             }
         }
@@ -398,16 +424,20 @@ impl NaviApp {
                 match ev {
                     egui::Event::Key { key, pressed: true, repeat: false, .. } => {
                         if self.search_active {
+                            // No early return here: egui delivers the Text
+                            // event for this same keystroke *after* the Key
+                            // event in the same batch — returning would eat it
+                            // and search typing would never register.
                             match key {
                                 Key::Escape    => { self.search_active = false; self.search_query.clear(); }
                                 Key::Enter     => { self.search_commit(); self.search_active = false; }
                                 Key::Backspace => { self.search_query.pop(); }
                                 _ => {}
                             }
-                            return;
+                            continue;
                         }
                         match key {
-                            Key::Q | Key::Escape => std::process::exit(0),
+                            Key::Q | Key::Escape => { self.quit_requested = true; }
                             Key::T => {
                                 self.theme_idx = (self.theme_idx + 1) % THEMES.len();
                                 self.popup = Some((THEMES[self.theme_idx].name.to_string(), self.now_secs));
@@ -460,7 +490,14 @@ impl NaviApp {
                                 };
                                 self.popup = Some((msg.into(), self.now_secs));
                             }
-                            Key::Slash => { self.search_active = true; self.search_query.clear(); }
+                            Key::Slash => {
+                                self.search_active = true;
+                                self.search_query.clear();
+                                // The '/' keystroke's own Text event is still
+                                // coming in this batch — swallow it so it
+                                // doesn't seed the query.
+                                self.search_swallow_slash = true;
+                            }
                             Key::Tab => {
                                 let n = self.node_ids.len().max(1) as i32;
                                 let shift = i.modifiers.shift;
@@ -484,7 +521,11 @@ impl NaviApp {
                         }
                     }
                     egui::Event::Text(text) if self.search_active => {
-                        self.search_query.push_str(text);
+                        if self.search_swallow_slash && text == "/" {
+                            self.search_swallow_slash = false;
+                        } else {
+                            self.search_query.push_str(text);
+                        }
                     }
                     _ => {}
                 }
@@ -496,6 +537,18 @@ impl NaviApp {
         let pointer = ctx.input(|i| i.pointer.clone());
         let scroll  = ctx.input(|i| i.smooth_scroll_delta);
         let hover_pos = pointer.hover_pos();
+
+        if std::env::var_os("NAVI_INPUT_DEBUG").is_some() {
+            eprintln!(
+                "navi-debug: hover_pos={:?} graph_rect={:?} any_pressed={} any_down={} is_moving={} node_at={:?}",
+                hover_pos,
+                self.graph_rect,
+                pointer.any_pressed(),
+                pointer.any_down(),
+                pointer.is_moving(),
+                hover_pos.map(|hp| self.node_at(hp.x, hp.y, hidden)),
+            );
+        }
 
         // Hover
         if !self.pan_dragging && self.node_dragging.is_none() {
@@ -743,6 +796,18 @@ impl NaviApp {
         self.last_active_at = Instant::now();
     }
 
+    /// True once the user pressed Q/Escape; main.rs exits the event loop.
+    pub fn take_quit_request(&mut self) -> bool {
+        std::mem::take(&mut self.quit_requested)
+    }
+
+    /// Long-unfocused (>5 min): main.rs stretches the idle wake-up from 33 ms
+    /// to 1 s. Wayland/composited-X11 never report full occlusion, so this is
+    /// what keeps a covered window from burning 30 paints/s indefinitely.
+    pub fn long_idle(&self) -> bool {
+        !self.window_focused && self.last_active_at.elapsed() > Duration::from_secs(300)
+    }
+
     /// Current theme background as `[r, g, b]` floats — used by main.rs to
     /// `glClear` the surface before egui paints into it.
     pub fn bg_color(&self) -> [f32; 3] {
@@ -827,7 +892,16 @@ impl NaviApp {
             .frame(egui::Frame::none().fill(t.bg))
             .show(ctx, |ui| {
                 let graph_rect = ui.available_rect_before_wrap();
+                let rect_changed = (graph_rect.size() - self.graph_rect.size()).length() > 1.0;
                 self.graph_rect = graph_rect; // cache for next frame's input
+                if !self.initial_fit_done {
+                    // First frame with the real viewport (a tiling WM may have
+                    // sized us to anything): redo the startup fit before painting.
+                    if rect_changed {
+                        self.fit_to_nodes();
+                    }
+                    self.initial_fit_done = true;
+                }
                 ui.allocate_rect(graph_rect, Sense::hover());
                 let painter = ui.painter_at(graph_rect);
 

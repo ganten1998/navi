@@ -1,3 +1,8 @@
+// Release builds on Windows are GUI-subsystem apps so double-clicking the exe
+// doesn't open a console window behind it. Debug builds keep the console for
+// live stderr. Release builds re-attach to a parent console in main() below.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod painter;
 mod theme;
@@ -36,6 +41,33 @@ pub enum UserEvent {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // GUI-subsystem builds have no std handles; if we were launched from a
+    // terminal, glue stderr back to it so the NAVI_* debug flags still print.
+    #[cfg(all(windows, not(debug_assertions)))]
+    unsafe {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    // A GUI-subsystem process that panics (GL bring-up failure, driver
+    // without a usable pixel format, …) would otherwise vanish without a
+    // trace — surface the message in a dialog instead.
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("Navi crashed:\n\n{info}");
+            let mut wide: Vec<u16> = msg.encode_utf16().collect();
+            wide.push(0);
+            let title: Vec<u16> = "Navi\0".encode_utf16().collect();
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+                MessageBoxW(std::ptr::null_mut(), wide.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+            }
+            default_hook(info);
+        }));
+    }
+
     let mut cfg = Config::load();
     if cfg.db.is_empty() {
         cfg.db = detect_db();
@@ -47,21 +79,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let db_path = expand_tilde(&cfg.db);
 
-    let (raw_nodes, raw_edges) = load_graph(&db_path).map_err(|e| {
-        eprintln!("navi: failed to load {db_path}: {e}");
-        e
-    })?;
-    let n_nodes = raw_nodes.len();
-    let n_edges = raw_edges.len();
-    let graph = Graph::new(raw_nodes, raw_edges);
-    eprintln!("navi: loaded {n_nodes} nodes, {n_edges} edges");
+    // A missing/unreadable db must not kill the app before a window exists —
+    // double-clicking the binary would just silently do nothing. Open with an
+    // empty graph and say where we looked; `W` re-reads the db once it exists.
+    let (graph, startup_error) = match load_graph(&db_path) {
+        Ok((raw_nodes, raw_edges)) => {
+            let n_nodes = raw_nodes.len();
+            let n_edges = raw_edges.len();
+            eprintln!("navi: loaded {n_nodes} nodes, {n_edges} edges");
+            (Graph::new(raw_nodes, raw_edges), None)
+        }
+        Err(e) => {
+            eprintln!("navi: failed to load {db_path}: {e}");
+            let msg = format!(
+                "No org-roam db at {db_path} — set \"db\" in {}, then press W to reload",
+                Config::config_path().display()
+            );
+            (Graph::new(Vec::new(), Vec::new()), Some(msg))
+        }
+    };
     cfg.save();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app_state = AppState::new(graph, cfg, db_path, proxy);
+    let mut app_state = AppState::new(graph, cfg, db_path, proxy, startup_error);
     event_loop.run_app(&mut app_state)?;
     Ok(())
 }
@@ -72,6 +115,11 @@ struct AppState {
     graph: Option<Graph>,
     cfg: Option<Config>,
     db_path: Option<String>,
+    startup_error: Option<String>,
+
+    // True while the OS reports the window fully hidden (macOS occlusion,
+    // X11 VisibilityNotify). Windows/Wayland never emit it — stays false there.
+    occluded: bool,
 
     // Created on `resumed` once we have an `ActiveEventLoop`.
     gl_window: Option<GlutinWindow>,
@@ -98,12 +146,20 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(graph: Graph, cfg: Config, db_path: String, proxy: EventLoopProxy<UserEvent>) -> Self {
+    fn new(
+        graph: Graph,
+        cfg: Config,
+        db_path: String,
+        proxy: EventLoopProxy<UserEvent>,
+        startup_error: Option<String>,
+    ) -> Self {
         Self {
             proxy,
             graph: Some(graph),
             cfg: Some(cfg),
             db_path: Some(db_path),
+            startup_error,
+            occluded: false,
             gl_window: None,
             gl: None,
             egui_glow: None,
@@ -123,8 +179,24 @@ impl ApplicationHandler<UserEvent> for AppState {
             return;
         }
 
-        let (gl_window, gl) = unsafe { GlutinWindow::create(event_loop) };
+        let borderless = self.cfg.as_ref().map_or(false, |c| c.borderless);
+        let (gl_window, gl) = unsafe { GlutinWindow::create(event_loop, borderless) };
         let gl = Arc::new(gl);
+
+        // Explicitly register as a regular, activated app. Without this the
+        // process never becomes frontmost: the window gets no keyboard focus
+        // (input appears dead) and AX-based tools — AeroSpace, yabai — don't
+        // even list it. Also what makes a bare `./navi` from a terminal
+        // focusable without an app bundle.
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+            let ns_app = NSApplication::sharedApplication(mtm);
+            ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            #[allow(deprecated)]
+            ns_app.activateIgnoringOtherApps(true);
+        }
+
         gl_window.window().set_visible(true);
 
         let egui_glow = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
@@ -140,7 +212,10 @@ impl ApplicationHandler<UserEvent> for AppState {
         let graph = self.graph.take().expect("graph initialised in main()");
         let cfg = self.cfg.take().expect("cfg initialised in main()");
         let db_path = self.db_path.take().expect("db_path initialised in main()");
-        let app = app::NaviApp::new(graph, cfg, db_path);
+        let mut app = app::NaviApp::new(graph, cfg, db_path);
+        if let Some(msg) = self.startup_error.take() {
+            app.set_startup_error(msg);
+        }
 
         self.gl_window = Some(gl_window);
         self.gl = Some(gl);
@@ -154,6 +229,11 @@ impl ApplicationHandler<UserEvent> for AppState {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        if std::env::var_os("NAVI_EVENT_DEBUG").is_some()
+            && !matches!(event, WindowEvent::CursorMoved { .. })
+        {
+            eprintln!("navi-event: {:?}", event);
+        }
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
             event_loop.exit();
             return;
@@ -167,6 +247,18 @@ impl ApplicationHandler<UserEvent> for AppState {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.redraw(event_loop);
             return;
+        }
+
+        // Fully-hidden tracking (macOS occlusion state, X11 VisibilityNotify;
+        // never emitted on Windows/Wayland). While hidden, redraw() skips
+        // painting entirely and keeps a slow poll timer instead.
+        if let WindowEvent::Occluded(occluded) = &event {
+            self.occluded = *occluded;
+            if !*occluded {
+                if let Some(gw) = self.gl_window.as_ref() {
+                    gw.window().request_redraw();
+                }
+            }
         }
 
         // True iff we're currently in idle (link paused, waiting on the 33 ms
@@ -261,6 +353,17 @@ impl AppState {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
 
+        // Fully hidden: don't paint at all. Keep a slow wake-up so pending
+        // reloads still land; the Occluded(false) handler repaints immediately.
+        if self.occluded {
+            #[cfg(target_os = "macos")]
+            macos_display::set_active(false);
+            let next = now + Duration::from_millis(250);
+            self.next_idle_wake = Some(next);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            return;
+        }
+
         // Coalesce duplicate redraw triggers. At 240 Hz the vsync window is
         // ~4.17 ms; a paint that lands within half of that of the previous
         // paint is a duplicate (e.g. a Vsync arrived microseconds after a
@@ -270,6 +373,11 @@ impl AppState {
         // worst-case frame in the FPS log even when avg is locked at 4.17.
         if let Some(prev) = self.last_paint_at {
             if now.duration_since(prev) < Duration::from_micros(2_000) {
+                // On swap-paced platforms this early-return would otherwise be
+                // the death of the redraw chain (nothing else is scheduled) —
+                // re-arm a short timer before bailing.
+                #[cfg(not(target_os = "macos"))]
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(4)));
                 return;
             }
         }
@@ -293,16 +401,28 @@ impl AppState {
         #[cfg(target_os = "macos")]
         macos_display::set_active(needs_full_speed);
         if !needs_full_speed {
-            let next = now + Duration::from_millis(33);
+            // 33 ms normally; stretch to 1 s once long-unfocused — platforms
+            // without occlusion events (Wayland, composited X11) would
+            // otherwise paint a fully covered window at 30 fps forever.
+            let long_idle = self.app.as_ref().map_or(false, |a| a.long_idle());
+            let next = now + Duration::from_millis(if long_idle { 1000 } else { 33 });
             self.next_idle_wake = Some(next);
             event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         } else {
-            // While active, control flow stays Wait — we paint only when a
-            // Vsync user-event arrives. No polling, no busy-looping. Clear
-            // `next_idle_wake` so the input/focus handlers in window_event
-            // know we're no longer in the idle path and don't fire extra
-            // request_redraw calls (which would cause double-paints).
+            // While active, we paint only when a Vsync user-event arrives. No
+            // polling, no busy-looping. Clear `next_idle_wake` so the
+            // input/focus handlers in window_event know we're no longer in the
+            // idle path and don't fire extra request_redraw calls (which would
+            // cause double-paints).
             self.next_idle_wake = None;
+            // macOS: keep a 100 ms fallback deadline armed. If the display
+            // link isn't delivering (e.g. still starting up), we degrade to
+            // slow paints instead of freezing; while the link runs normally,
+            // every Vsync paint re-arms this before it can fire, and a
+            // spurious firing is swallowed by the coalescing guard above.
+            #[cfg(target_os = "macos")]
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(100)));
+            #[cfg(not(target_os = "macos"))]
             event_loop.set_control_flow(ControlFlow::Wait);
         }
 
@@ -315,6 +435,13 @@ impl AppState {
             app.update(ctx);
         });
 
+        // Q/Escape: exit through the event loop so exiting() destroys the GL
+        // state properly (drivers on Linux dislike a raw process::exit).
+        if app.take_quit_request() {
+            event_loop.exit();
+            return;
+        }
+
         // Paint.
         let theme_bg = app.bg_color();
         unsafe {
@@ -324,8 +451,31 @@ impl AppState {
             gl.clear(glow::COLOR_BUFFER_BIT);
         }
         eg.paint(gw.window());
+        #[cfg(not(target_os = "macos"))]
+        let swap_started = Instant::now();
         let _ = gw.swap_buffers();
         self.last_paint_at = Some(now);
+
+        // Non-macOS pacer: there's no CADisplayLink-style bg thread sending
+        // Vsync user-events, so re-arm the next frame ourselves while active.
+        //   X11 / Windows: `swap_buffers` above normally blocked until vblank
+        //   (`Wait(1)`), so request_redraw isn't a busy loop — it's paced at
+        //   the display's refresh rate. But swaps can stop blocking (window
+        //   unmapped on an i3 workspace switch, minimized on Windows, driver
+        //   with vsync forced off) — if this swap returned instantly, fall
+        //   back to timer pacing so we neither stall nor spin.
+        //   Wayland: the swap must never block (compositors stop frame
+        //   callbacks for hidden surfaces, which would freeze us), so the
+        //   swap interval is DontWait there and the timer is the only pacer.
+        #[cfg(not(target_os = "macos"))]
+        if needs_full_speed {
+            let swap_blocked = swap_started.elapsed() >= Duration::from_millis(1);
+            if gw.paces_via_swap && swap_blocked {
+                gw.window().request_redraw();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + gw.frame_interval()));
+            }
+        }
 
         // Diagnostics
         if std::env::var_os("NAVI_FPS_LOG").is_some() {
@@ -379,19 +529,55 @@ struct GlutinWindow {
     gl_context: glutin::context::PossiblyCurrentContext,
     gl_display: glutin::display::Display,
     gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+    /// True where `swap_buffers` blocks until vblank and thereby paces the
+    /// render loop (X11, Windows). False on macOS (display link paces) and
+    /// Wayland (timer paces).
+    paces_via_swap: bool,
 }
 
 impl GlutinWindow {
     /// Construct the window + GL context. Adapted from egui_glow's pure_glow example.
-    /// Vsync is left ON (`SwapInterval::Wait(1)`) — it's harmless at 0.5 ms render
-    /// time and gives the OS a clean signal that we want display sync.
-    unsafe fn create(event_loop: &ActiveEventLoop) -> (Self, glow::Context) {
-        let window_attrs = winit::window::WindowAttributes::default()
+    unsafe fn create(event_loop: &ActiveEventLoop, borderless: bool) -> (Self, glow::Context) {
+        // Clamp the default size to the monitor so HiDPI X11 setups (where
+        // winit may infer a 2–3× scale from EDID) don't open bigger than the
+        // screen.
+        let mut initial_size = winit::dpi::LogicalSize::<f64>::new(1400.0, 900.0);
+        if let Some(mon) = event_loop.primary_monitor() {
+            let logical: winit::dpi::LogicalSize<f64> = mon.size().to_logical(mon.scale_factor());
+            if logical.width > 0.0 && logical.height > 0.0 {
+                initial_size.width = initial_size.width.min(logical.width * 0.92);
+                initial_size.height = initial_size.height.min(logical.height * 0.92);
+            }
+        }
+
+        #[allow(unused_mut)]
+        let mut window_attrs = winit::window::WindowAttributes::default()
             .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
+            .with_inner_size(initial_size)
             .with_min_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0))
             .with_title("Navi")
+            // Normal decorated window by default; `"borderless": true` in
+            // config.json opts back into the chromeless look. Tiling WMs
+            // (AeroSpace, i3) manage the decorated window much better.
+            .with_decorations(!borderless)
             .with_visible(false);
+
+        // WM_CLASS on X11 / app_id on Wayland (both read the same attribute) —
+        // gives i3/sway users a stable handle: `for_window [class="navi"] …`
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::x11::WindowAttributesExtX11;
+            window_attrs = window_attrs.with_name("navi", "navi");
+        }
+
+        // Taskbar/titlebar icon — honored on Windows and X11; macOS uses the
+        // app bundle's icns and Wayland the .desktop file, both no-ops here.
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(icon) = load_window_icon() {
+                window_attrs = window_attrs.with_window_icon(Some(icon));
+            }
+        }
 
         let cfg_template = glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(None)
@@ -402,8 +588,21 @@ impl GlutinWindow {
         let (mut window_opt, gl_config) = glutin_winit::DisplayBuilder::new()
             .with_preference(glutin_winit::ApiPreference::FallbackEgl)
             .with_window_attributes(Some(window_attrs.clone()))
-            .build(event_loop, cfg_template, |mut it| {
-                it.next().expect("no matching gl config")
+            .build(event_loop, cfg_template, |it| {
+                // Drivers list many configs; the first isn't always sane
+                // (X11/Mesa may lead with multisampled ones). egui does its own
+                // AA, so prefer no MSAA, then sRGB capability.
+                use glutin::config::GlConfig as _;
+                it.reduce(|best, c| {
+                    let score = |c: &glutin::config::Config| -> i32 {
+                        let mut s = 0;
+                        if c.num_samples() == 0 { s += 100; }
+                        if c.srgb_capable() { s += 10; }
+                        s
+                    };
+                    if score(&c) > score(&best) { c } else { best }
+                })
+                .expect("no matching gl config")
             })
             .expect("failed to create gl_config");
 
@@ -451,12 +650,32 @@ impl GlutinWindow {
             .make_current(&gl_surface)
             .expect("failed to make context current");
 
-        // Vsync OFF. macOS OpenGL's swap-vsync is capped at ~108 Hz on ProMotion
-        // panels regardless of what tier the display is actually running at, so
-        // letting it block here would clamp us to 108 fps even though the display
-        // link is firing at 240 Hz. Pacing is owned entirely by the bg-thread
-        // display link in macos_display.rs.
-        let _ = gl_surface.set_swap_interval(&gl_context, glutin::surface::SwapInterval::DontWait);
+        // macOS: vsync OFF. macOS OpenGL's swap-vsync is capped at ~108 Hz on
+        // ProMotion panels regardless of what tier the display is actually
+        // running at, so letting it block here would clamp us to 108 fps even
+        // though the display link is firing at 240 Hz. Pacing is owned entirely
+        // by the bg-thread display link in macos_display.rs.
+        //
+        // X11 / Windows: there is no display-link equivalent, so the blocking
+        // swap itself is the pacer — `redraw()` re-arms itself with
+        // `request_redraw()` right after painting, and `Wait(1)` throttles that
+        // loop to the monitor's actual refresh rate via the GL driver/compositor.
+        //
+        // Wayland: a blocking swap waits on compositor frame callbacks, which
+        // stop entirely for hidden/occluded surfaces (and winit can't tell us —
+        // Occluded is unsupported there), so a Wait(1) swap can freeze the app.
+        // Swap DontWait and pace with a WaitUntil timer at the monitor's rate.
+        let is_wayland = matches!(
+            window.window_handle().map(|h| h.as_raw()),
+            Ok(raw_window_handle::RawWindowHandle::Wayland(_))
+        );
+        let paces_via_swap = !cfg!(target_os = "macos") && !is_wayland;
+        let swap_interval = if paces_via_swap {
+            glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap())
+        } else {
+            glutin::surface::SwapInterval::DontWait
+        };
+        let _ = gl_surface.set_swap_interval(&gl_context, swap_interval);
 
         let gl = unsafe {
             glow::Context::from_loader_function(|s| {
@@ -471,6 +690,7 @@ impl GlutinWindow {
                 gl_context,
                 gl_display,
                 gl_surface,
+                paces_via_swap,
             },
             gl,
         )
@@ -478,6 +698,17 @@ impl GlutinWindow {
 
     fn window(&self) -> &Window {
         &self.window
+    }
+
+    /// One display refresh period, for the Wayland timer pacer.
+    #[cfg(not(target_os = "macos"))]
+    fn frame_interval(&self) -> Duration {
+        self.window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map(|mhz| Duration::from_secs_f64(1000.0 / mhz as f64))
+            .unwrap_or(Duration::from_micros(16_667))
     }
 
     fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
@@ -496,33 +727,120 @@ impl GlutinWindow {
 
 // ─── Fonts ────────────────────────────────────────────────────────────────────
 
-/// Load a prioritised font fallback chain so egui can render:
-///   • Nerd Font symbols (powerline, devicons, file icons)  — Meslo NF
-///   • Japanese / CJK                                       — Noto Sans JP
-///   • Broad Unicode catch-all (~50 k glyphs)               — Arial Unicode
-///   • Extra maths / misc symbols                           — Noto Sans Symbols 2
+/// Load a prioritised font fallback chain (appended after egui's defaults) so
+/// egui can render Nerd Font symbols, CJK, and misc Unicode where the system
+/// has suitable fonts. Everything here is best-effort: a missing font just
+/// means those glyphs fall back to egui's built-ins (or tofu).
 fn setup_fonts(ctx: &egui::Context) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates: &[(&str, String)] = &[
-        ("nerd",     format!("{home}/Library/Fonts/MesloLGLNerdFont-Regular.ttf")),
-        ("jp",       "/Library/Fonts/NotoSansJP-Regular.otf".into()),
-        ("unicode",  "/Library/Fonts/Arial Unicode.ttf".into()),
-        ("symbols2", "/Library/Fonts/NotoSansSymbols2-Regular.ttf".into()),
-    ];
     let mut fonts = egui::FontDefinitions::default();
-    for (name, path) in candidates {
-        if let Ok(data) = std::fs::read(path) {
+    for (name, path) in font_candidates() {
+        if let Ok(data) = std::fs::read(&path) {
             fonts
                 .font_data
-                .insert((*name).to_string(), egui::FontData::from_owned(data));
+                .insert(name.clone(), egui::FontData::from_owned(data));
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .push((*name).to_string());
+                fonts.families.entry(family).or_default().push(name.clone());
             }
         }
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(target_os = "macos")]
+fn font_candidates() -> Vec<(String, std::path::PathBuf)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    [
+        ("nerd",     format!("{home}/Library/Fonts/MesloLGLNerdFont-Regular.ttf")),
+        ("jp",       "/Library/Fonts/NotoSansJP-Regular.otf".into()),
+        ("unicode",  "/Library/Fonts/Arial Unicode.ttf".into()),
+        ("symbols2", "/Library/Fonts/NotoSansSymbols2-Regular.ttf".into()),
+    ]
+    .into_iter()
+    .map(|(n, p)| (n.to_string(), std::path::PathBuf::from(p)))
+    .collect()
+}
+
+/// Linux: font locations aren't standardized across distros, so walk the usual
+/// font roots (bounded) looking for well-known single-face files. Deliberately
+/// skips .ttc collections — we only hand egui files it is known to parse.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn font_candidates() -> Vec<(String, std::path::PathBuf)> {
+    use std::path::PathBuf;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join(".local/share/fonts"));
+        roots.push(PathBuf::from(&home).join(".fonts"));
+    }
+    roots.push(PathBuf::from("/usr/share/fonts"));
+    roots.push(PathBuf::from("/usr/local/share/fonts"));
+
+    // slot → exact filenames accepted for it, in preference order. .ttc/.otc
+    // collections are fine — egui's FontData loads face 0.
+    let wanted: &[(&str, &[&str])] = &[
+        ("jp",       &["NotoSansJP-Regular.otf", "NotoSansJP-Regular.ttf", "NotoSansCJKjp-Regular.otf",
+                       "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.otc", "NotoSansCJK.ttc"]),
+        ("unicode",  &["DejaVuSans.ttf", "NotoSans-Regular.ttf"]),
+        ("symbols2", &["NotoSansSymbols2-Regular.ttf"]),
+    ];
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    let mut nerd: Option<PathBuf> = None;
+    let mut stack: Vec<(PathBuf, u8)> = roots.into_iter().map(|r| (r, 0u8)).collect();
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        visited += 1;
+        if visited > 800 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if nerd.is_none() && fname.contains("NerdFont") && fname.ends_with("-Regular.ttf") {
+                nerd = Some(path.clone());
+            }
+            for (slot, names) in wanted {
+                if names.contains(&fname) && !found.iter().any(|(s, _)| s == slot) {
+                    found.push((slot.to_string(), path.clone()));
+                }
+            }
+        }
+    }
+    if let Some(p) = nerd {
+        found.insert(0, ("nerd".to_string(), p));
+    }
+    found
+}
+
+#[cfg(windows)]
+fn font_candidates() -> Vec<(String, std::path::PathBuf)> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let fonts = std::path::PathBuf::from(windir).join("Fonts");
+    // .ttc collections are fine — egui's FontData loads face 0. Windows ships
+    // no single-face JP font, so the JP slot has to be a collection.
+    let mut out = Vec::new();
+    for jp in ["YuGothM.ttc", "yugothm.ttc", "meiryo.ttc", "msgothic.ttc"] {
+        let p = fonts.join(jp);
+        if p.is_file() {
+            out.push(("jp".to_string(), p));
+            break;
+        }
+    }
+    out.push(("symbols".to_string(), fonts.join("seguisym.ttf")));
+    out
+}
+
+/// Decode the bundled icon for the window/taskbar (Windows + X11).
+#[cfg(not(target_os = "macos"))]
+fn load_window_icon() -> Option<winit::window::Icon> {
+    let png = include_bytes!("../../assets/icon.png");
+    let img = image::load_from_memory(png).ok()?.thumbnail(64, 64).into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }

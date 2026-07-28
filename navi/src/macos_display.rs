@@ -211,6 +211,11 @@ fn run_bg_link(max_fps: f32) {
     let raw_link = Retained::as_ptr(&link).cast_mut();
     let _ = LINK.set(LinkPtr(raw_link));
 
+    // A set_active(true) may have raced us before LINK was published (the
+    // first paint often happens while this thread is still setting up) — that
+    // call only recorded the desired state in LINK_ACTIVE. Apply it now.
+    link.setPaused(!LINK_ACTIVE.load(Ordering::Relaxed));
+
     // Hold the link Retained alive forever — it runs for the process lifetime.
     std::mem::forget(link);
     std::mem::forget(target);

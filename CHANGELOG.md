@@ -2,7 +2,57 @@
 
 All notable changes to Navi are documented here.
 
-## [1.0.0] — 2026-05-20
+## [1.0.0] — 2026-05-20, re-released 2026-07-28
+
+The 2026-07-28 re-release (same version, tag recut) makes the app fully
+cross-platform and fixes several bugs found while porting:
+
+### Re-release — Added
+
+- **Linux support (X11 + Wayland, one binary)** — winit's Linux backends are now
+  enabled; pacing via blocking `SwapInterval::Wait(1)` swaps on X11 / a
+  refresh-rate timer on Wayland (blocking swaps can freeze there when a
+  compositor withholds frame callbacks). Sets `WM_CLASS` / `app_id` to `navi`
+  for i3/sway rules; pre-built x86_64 + aarch64 glibc binaries with a
+  `navi.desktop` file ship with the release.
+- **Windows support** — talks to the Emacs server via its native TCP
+  `server-file` (with the `%APPDATA%` home resolution stock Emacs uses), finds
+  `emacsclientw.exe` across official/Chocolatey/Scoop/MSYS2 installs, builds as
+  a GUI-subsystem app (no console window; parent console re-attached for
+  debug flags; panics surface in a dialog), db auto-detection probes
+  `%APPDATA%`, and a pre-built x64 exe ships with the release.
+- **`borderless` config option** — implemented (it existed in the config schema
+  but was never applied); default is a normal decorated window, which tiling
+  WMs (AeroSpace, i3) can actually manage.
+- **Window icon on X11/Windows**, per-OS font fallback chains (CJK via `.ttc`
+  collections on Windows/Linux), HiDPI initial-size clamp, and a friendly
+  in-window message (instead of a silent exit) when no org-roam db is found.
+
+### Re-release — Fixed
+
+- **Startup race that froze the app** — the CADisplayLink activation could be
+  requested before the background thread published the link; the resume was
+  dropped and no frame was ever painted. Also added a fallback wake-up so a
+  stalled pacer can never freeze the UI again.
+- **App never activated on macOS** — the process never registered as a regular
+  activated app, so the window got no keyboard focus and AX-based tools
+  (AeroSpace, yabai) didn't even list it.
+- **Search input was dead** — the key handler swallowed the `Text` events that
+  follow each keypress, so `/` seeded the query with a slash and typed
+  characters never registered.
+- **CJK crash** — selecting a node with a long multi-byte title panicked on a
+  byte-sliced truncation.
+- **Startup fit under tiling WMs** — the initial zoom/center assumed a
+  1400×870 viewport; now re-fits to the real first-frame size, and `R` uses
+  the live viewport too.
+- Lisp string unescaping for titles/files/aliases (quoted tags are now
+  stripped like everything else), sqlite `busy_timeout` so a load racing
+  `org-roam-db-sync` doesn't abort, GL config scoring (prefer no-MSAA + sRGB),
+  `Q`/`Escape` exits through the event loop instead of `process::exit` (clean
+  GL teardown), emacsclient children are reaped (no zombies), and `~` in the
+  configured `emacsclient` path expands.
+
+## Original release notes — 2026-05-20
 
 Full ground-up rewrite from Python (pygame + ModernGL) to Rust (egui + glow). Same conceptual feature set, dramatically better performance and packaging. The previous Python release is superseded and unsupported.
 

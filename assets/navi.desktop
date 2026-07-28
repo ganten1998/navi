@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Navi
+Comment=Interactive graph viewer for org-roam
+Exec=navi
+Icon=navi
+Terminal=false
+Categories=Office;Utility;
+StartupWMClass=navi

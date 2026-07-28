@@ -9,16 +9,20 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 ## Status
 
 - **macOS** — primary target, fully supported. Tested on Apple Silicon (M-series) at 60 / 120 / 240 Hz. A pre-built `Navi.app` ships with each release.
-- **Linux** — builds cleanly; the macOS-only `CADisplayLink` pacer is gated, so a small amount of glue (using `SwapInterval::Wait(1)` or Wayland presentation-time / DRM vblank) is required before it renders. Everything else (egui, winit, glutin, sqlite, emacsclient discovery) is cross-platform.
-- **Windows** — not supported. The `emacsclient` socket discovery is Unix-only and the macOS pacer would have to be replaced by DXGI waitable swap chains.
+- **Linux** — supported, X11 and Wayland backends both built in (one binary; X11 is picked automatically under i3 and other X11 WMs). Vsync pacing via blocking `SwapInterval::Wait(1)` swaps on X11, and a refresh-rate timer on Wayland. Sets `WM_CLASS` / `app_id` to `navi` for window-manager rules. Pre-built x86_64 and aarch64 glibc binaries ship with each release.
+- **Windows** — supported. Talks to the Emacs server over its native TCP `server-file` mechanism, finds `emacsclientw.exe` across the official installer / Chocolatey / Scoop / MSYS2 layouts, and builds as a GUI-subsystem app (no console window). A pre-built x64 exe ships with each release.
 
 ---
 
 ## Quick start
 
-### Pre-built macOS app (Apple Silicon)
+### Pre-built binaries
 
-Download `Navi-<version>-host.zip` from the [Releases](https://codeberg.org/ganten1998/navi/releases) page, unzip, and double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it — right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
+All from the [Releases](https://codeberg.org/ganten1998/navi/releases) page:
+
+- **macOS (Apple Silicon)** — `Navi-<version>-host.zip`: unzip, double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it — right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
+- **Linux** — `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL — present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).
+- **Windows (x64)** — `navi-<version>-windows-x86_64.zip`: unzip, run `navi.exe`.
 
 ### From source
 
@@ -45,8 +49,8 @@ On first run, Navi auto-detects your `org-roam.db` and creates `~/.config/navi/c
 
 - **Rust 1.75+** (stable) — install via [rustup](https://rustup.rs/) (source builds only)
 - **org-roam v2** database (`nodes`, `files`, `links`, `tags`, `aliases`)
-- **emacsclient** + a running Emacs server (`(server-start)` in your init) — for double-click-to-open
-- A working OpenGL 3.3 context — built into macOS / standard on Linux
+- **emacsclient** + a running Emacs server (`(server-start)` in your init) — for double-click-to-open. On Windows the server runs in TCP mode automatically; nothing extra to configure.
+- A working OpenGL (or GLES) context — built into macOS, standard on Linux (Mesa) and Windows
 
 ---
 
@@ -59,16 +63,18 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
   "db": "~/.emacs.d/org-roam.db",
   "emacsclient": "/opt/homebrew/bin/emacsclient",
   "server_name": "server",
-  "show_fps": true
+  "show_fps": true,
+  "borderless": false
 }
 ```
 
 | Key | Description |
 |---|---|
 | `db` | Path to `org-roam.db`. Auto-detected from common Emacs / Doom / Spacemacs / XDG locations on first run. |
-| `emacsclient` | Path to `emacsclient`. Bare names are resolved against Homebrew, MacPorts, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`, `~/.nix-profile/bin`, NixOS, Snap, and `/Applications/Emacs.app`. |
+| `emacsclient` | Path to `emacsclient`. Bare names are resolved against `PATH` plus the common per-OS install locations (Homebrew, MacPorts, `/Applications/Emacs.app`, `~/.nix-profile`, Snap, and on Windows the official installer, Chocolatey, Scoop, and MSYS2 layouts — preferring `emacsclientw.exe` there). |
 | `server_name` | Emacs server name (default `server`). |
 | `show_fps` | Show FPS counter in the status bar (`F` toggles at runtime). |
+| `borderless` | Draw the window without titlebar/decorations (default `false`). Leave off under tiling WMs — a decorated, resizable window is what lets AeroSpace / i3 tile it. |
 
 The legacy config path `~/.config/org-roam-graph/config.json` is also read; the next save writes to the new path.
 
@@ -92,13 +98,11 @@ The legacy config path `~/.config/org-roam-graph/config.json` is also read; the 
 
 Double-click a node (or select it and press `Enter` / `Space`). File nodes open the file; **headline nodes jump to the heading** via `goto-char`.
 
-GUI apps on macOS get a minimal `PATH`, so Navi resolves `emacsclient` to an absolute path and probes the server socket under:
+GUI apps get a minimal `PATH`, so Navi resolves `emacsclient` to an absolute path itself and locates the running server:
 
-- `$EMACS_SERVER_SOCKET` / `$EMACS_SERVER_FILE`
-- `$XDG_RUNTIME_DIR/emacs/`
-- `$TMPDIR/emacs{uid}/`
-- `/tmp`, `/private/tmp`
-- `/var/folders/*/*/T/emacs{uid}/` (macOS GUI vs Terminal `TMPDIR` mismatch)
+- Unix (socket): `$EMACS_SOCKET_NAME` / `$EMACS_SERVER_SOCKET`, `$XDG_RUNTIME_DIR/emacs/`, `$TMPDIR/emacs{uid}/`, `/tmp`, `/private/tmp` (covers the macOS GUI-vs-Terminal `TMPDIR` mismatch)
+- Unix (TCP mode): `$EMACS_SERVER_FILE`, `~/.emacs.d/server/`, `$XDG_CONFIG_HOME/emacs/server/`
+- Windows (always TCP): `$EMACS_SERVER_FILE`, then `.emacs.d/server/` and `.config/emacs/server/` under `%HOME%`, `%APPDATA%`, `%USERPROFILE%` — passed via `--server-file`
 
 If open fails, an error appears in the status bar. Make sure Emacs has `(server-start)` in its init.
 
@@ -135,14 +139,13 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 
 ## Frame pacing
 
-On macOS Navi runs a hand-rolled event loop:
+Mouse / keyboard events do **not** trigger paints on any platform — a per-platform vsync source is the sole paint signal, which eliminates the multi-paint-per-frame burn that input-driven loops produce. After ~10 s of inactivity (configurable with `NAVI_IDLE_GRACE_SECS`) the app drops to a ~30 fps idle tier; the next input or focus event restores full speed within a frame.
 
-- A dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`. On each vsync it sends a `UserEvent::Vsync` to the main thread via winit's `EventLoopProxy`.
-- Mouse / keyboard events do **not** trigger paints. Display vsync ticks are the sole paint signal — this eliminates the multi-paint-per-frame burn that input-driven loops produce.
-- After ~10 s of inactivity (configurable with `NAVI_IDLE_GRACE_SECS`), the link pauses and the OS drops the panel to its lowest tier. The next input or focus event resumes the link within a frame.
-- OpenGL's `swap_buffers` is called with `SwapInterval::DontWait` — macOS GL caps swap-vsync at ~108 Hz on ProMotion panels regardless of the displayed tier, so the display-link does the pacing instead.
+- **macOS** — a dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`; each vsync sends a `UserEvent::Vsync` to the main thread. `swap_buffers` uses `SwapInterval::DontWait` because macOS GL caps swap-vsync at ~108 Hz on ProMotion panels regardless of tier — the display link does the pacing.
+- **Linux/X11 & Windows** — vsync-blocking swaps (`SwapInterval::Wait(1)`): each paint re-arms the next `request_redraw`, and the blocking swap throttles the loop to the monitor's refresh rate.
+- **Linux/Wayland** — swaps never block (compositors stop frame callbacks for hidden surfaces, which would freeze a blocking swap); a `WaitUntil` timer paces at the monitor's reported refresh rate instead. When the window is fully occluded (macOS occlusion state, X11 visibility events) painting stops entirely.
 
-Result on a 240 Hz display: 4.17 ms average frame interval, worst-case 5–7 ms (no missed vsyncs in steady state), and the application sits near 0 % CPU when idle.
+Result on a 240 Hz display (macOS): 4.17 ms average frame interval, worst-case 5–7 ms (no missed vsyncs in steady state), and the application sits near 0 % CPU when idle.
 
 ### Diagnostics
 
@@ -152,6 +155,9 @@ Result on a 240 Hz display: 4.17 ms average frame interval, worst-case 5–7 ms 
 | `NAVI_PROF=1` | Print per-layer paint timing (grid/edges/nodes/labels/help) every ~1 s |
 | `NAVI_IDLE_GRACE_SECS=N` | Override the 10 s active-after-idle grace window |
 | `NAVI_NO_GRID`, `NAVI_NO_EDGES`, `NAVI_NO_NODES`, `NAVI_NO_LABELS` | Disable individual paint layers (perf debugging) |
+| `NAVI_EVENT_DEBUG=1` | Print every window event except cursor moves (platform debugging) |
+| `NAVI_INPUT_DEBUG=1` | Print per-frame pointer/hover/hit-test state |
+| `WINIT_X11_SCALE_FACTOR=1` | (winit built-in) Override X11 HiDPI scale if EDID-derived scaling misfires |
 
 ---
 
@@ -171,7 +177,8 @@ navi/                     Binary: UI, rendering, event loop
   src/macos_display.rs    macOS CADisplayLink + tier control
   src/theme.rs            Colour themes
 scripts/build-macos.sh    Cargo build + Navi.app + zip for release
-assets/icon.icns          App bundle icon
+assets/icon.png           App icon (bundle icns is generated from this)
+assets/navi.desktop       Linux desktop entry (shipped in the Linux tarball)
 ```
 
 ---

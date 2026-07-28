@@ -93,6 +93,21 @@ pub fn detect_db() -> String {
             return expanded;
         }
     }
+    // Windows: Emacs resolves `~` as HOME, then APPDATA (the default when
+    // nothing is configured — stock installs put .emacs.d under Roaming, which
+    // dirs::home_dir() (= USERPROFILE) never sees).
+    #[cfg(windows)]
+    for key in &["HOME", "APPDATA", "USERPROFILE"] {
+        if let Ok(root) = std::env::var(key) {
+            if root.is_empty() { continue; }
+            for sub in &[".emacs.d", ".config/emacs"] {
+                let p = std::path::Path::new(&root).join(sub).join("org-roam.db");
+                if p.exists() {
+                    return p.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
     expand_tilde(DB_CANDIDATES[0])
 }
 

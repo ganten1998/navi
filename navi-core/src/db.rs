@@ -18,6 +18,9 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    // org-roam-db-sync may be writing while we read; don't fail the whole
+    // load (or startup) on a transient SQLITE_BUSY.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
 
     let mut nodes: HashMap<String, RawNode> = HashMap::new();
 
@@ -41,8 +44,8 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
             })?;
             for row in iter.flatten() {
                 let (id, title, file, level, pos, mtime_raw) = row;
-                let title = title.trim_matches('"').to_string();
-                let file = file.trim_matches('"').to_string();
+                let title = unquote(&title);
+                let file = unquote(&file);
                 let mtime = parse_mtime(mtime_raw.as_deref());
                 nodes.insert(id.clone(),
                     RawNode { id, title, file, level, pos, mtime, aliases: vec![], tags: vec![] });
@@ -63,8 +66,8 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
             })?;
             for row in iter.flatten() {
                 let (id, title, file, level, pos) = row;
-                let title = title.trim_matches('"').to_string();
-                let file = file.trim_matches('"').to_string();
+                let title = unquote(&title);
+                let file = unquote(&file);
                 nodes.insert(id.clone(),
                     RawNode { id, title, file, level, pos, mtime: 0, aliases: vec![], tags: vec![] });
             }
@@ -94,7 +97,7 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
         if let Ok(iter) = iter {
             for row in iter.flatten() {
                 if let Some(n) = nodes.get_mut(&row.0) {
-                    let alias = row.1.trim_matches('"').to_string();
+                    let alias = unquote(&row.1);
                     if !alias.is_empty() {
                         n.aliases.push(alias);
                     }
@@ -111,8 +114,9 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
         if let Ok(iter) = iter {
             for row in iter.flatten() {
                 if let Some(n) = nodes.get_mut(&row.0) {
-                    if !row.1.is_empty() {
-                        n.tags.push(row.1);
+                    let tag = unquote(&row.1);
+                    if !tag.is_empty() {
+                        n.tags.push(tag);
                     }
                 }
             }
@@ -121,6 +125,29 @@ pub fn load_graph(db_path: &str) -> rusqlite::Result<(Vec<RawNode>, Vec<(String,
 
     let node_list: Vec<RawNode> = nodes.into_values().collect();
     Ok((node_list, edges))
+}
+
+/// org-roam stores strings as Lisp-printed literals: wrapped in one pair of
+/// double quotes, with `\"` and `\\` escapes inside. Strip exactly one quote
+/// pair (a title legitimately ending in `"` keeps it) and unescape; strings
+/// stored without quotes pass through untouched.
+fn unquote(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) => out.push(n),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Parse Emacs mtime which may be:
