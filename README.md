@@ -18,12 +18,12 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 ### Pre-built macOS app (Apple Silicon)
 
-Download `Navi-<version>-host.zip` from the [Releases](https://github.com/ganten7/navi/releases) page, unzip, and double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it — right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
+Download `Navi-<version>-host.zip` from the [Releases](https://codeberg.org/ganten1998/navi/releases) page, unzip, and double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it — right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
 
 ### From source
 
 ```bash
-git clone https://github.com/ganten7/navi.git
+git clone https://codeberg.org/ganten1998/navi.git
 cd navi
 cargo build --release
 ./target/release/navi
