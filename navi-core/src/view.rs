@@ -137,7 +137,45 @@ pub struct ViewState {
     pub orphan:         Vec<bool>,  // isolated in this view (independent of the orphan filter)
     pub db_orphan:      Vec<bool>,  // no real links in the whole db
     pub daily:          Vec<bool>,
+    pub pass_degree:    Vec<usize>, // real links to nodes that pass the attribute filters (dailies, hidden groups)
     pub counts:         ViewCounts,
+}
+
+/// Why a node is (or isn't) an orphan in a view; the same split the
+/// counts make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanKind {
+    Linked,            // has a link in this view
+    InDb,              // no real link at all
+    IsolatedByFilters, // every real link goes to a node the filters removed
+    DailyOnly,         // linked, but only to dailies (links_to_dailies_count = false)
+}
+
+impl OrphanKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            OrphanKind::Linked            => "Not an orphan",
+            OrphanKind::InDb              => "Orphan in the db (no links at all)",
+            OrphanKind::IsolatedByFilters => "Orphan in this view (isolated by filters)",
+            OrphanKind::DailyOnly         => "Orphan in this view (daily-only)",
+        }
+    }
+}
+
+impl ViewState {
+    pub fn orphan_kind(&self, i: usize) -> OrphanKind {
+        if !self.orphan.get(i).copied().unwrap_or(false) { return OrphanKind::Linked; }
+        if self.db_orphan.get(i).copied().unwrap_or(false) { return OrphanKind::InDb; }
+        if self.pass_degree.get(i).copied().unwrap_or(0) == 0 { OrphanKind::IsolatedByFilters } else { OrphanKind::DailyOnly }
+    }
+}
+
+/// `file` relative to the notes root (`root_depth` leading directories, see
+/// `notes_root_depth`), always `/`-separated. Shorter paths come back whole.
+pub fn relative_to_root(file: &str, root_depth: usize) -> String {
+    let parts: Vec<&str> = file.split(['/', '\\']).collect();
+    if root_depth >= parts.len() { return parts.join("/"); }
+    parts[root_depth..].join("/")
 }
 
 fn date_title_re() -> &'static Regex {
@@ -238,7 +276,7 @@ pub fn compute_view_hiding(g: &Graph, f: &ViewFilter, hidden: &[bool]) -> ViewSt
         dangling:            g.dangling.len(),
         hidden_by_groups:    count(&|i| hidden(i) && !(daily[i] && f.dailies == DailiesMode::Hide)),
     };
-    ViewState { visible, visible_edges, visible_degree, orphan, db_orphan, daily, counts }
+    ViewState { visible, visible_edges, visible_degree, orphan, db_orphan, daily, pass_degree: pass_deg, counts }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -504,6 +542,31 @@ mod tests {
         // a mask of the wrong length is ignored (stale), never indexed
         let v = compute_view_hiding(&g, &ViewFilter::default(), &[true]);
         assert!(v.visible[a] && v.visible[b] && v.visible[d]);
+    }
+
+    /// The inspector's orphan wording matches the counts' split.
+    #[test]
+    fn orphan_kind_per_node() {
+        let g = fixture();
+        let (x, d, a, o) = (idx(&g, "x"), idx(&g, "d"), idx(&g, "a"), idx(&g, "o"));
+        let v = compute_view(&g, &filt(DailiesMode::Show, OrphansMode::Show, true));
+        assert_eq!((v.orphan_kind(x), v.orphan_kind(a), v.orphan_kind(o)), (OrphanKind::Linked, OrphanKind::Linked, OrphanKind::InDb));
+        let v = compute_view(&g, &filt(DailiesMode::Hide, OrphansMode::Show, true));
+        assert_eq!(v.orphan_kind(x), OrphanKind::IsolatedByFilters);
+        let v = compute_view(&g, &filt(DailiesMode::Show, OrphansMode::Show, false));
+        assert_eq!(v.orphan_kind(x), OrphanKind::DailyOnly);
+        assert_eq!(v.orphan_kind(d), OrphanKind::DailyOnly, "a daily linked only to an orphan note");
+        assert_eq!(ViewState::default().orphan_kind(3), OrphanKind::Linked, "out of range: no panic");
+    }
+
+    #[test]
+    fn paths_relative_to_the_notes_root() {
+        let files = ["/n/posts/a.org", "/n/b.org"];
+        let root = notes_root_depth(files);
+        assert_eq!(relative_to_root("/n/posts/a.org", root), "posts/a.org");
+        assert_eq!(relative_to_root("/n/b.org", root), "b.org");
+        assert_eq!(relative_to_root(r"C:\notes\x\y.org", 2), "x/y.org");
+        assert_eq!(relative_to_root("a.org", 5), "a.org");
     }
 
     #[test]

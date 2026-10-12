@@ -2,13 +2,18 @@ use egui::{Color32, Key, Pos2, Rect, Sense, Stroke, Vec2, epaint::FontId};
 use navi_core::{
     config::Config,
     groups::{AutoGrouper, GroupResolution, GroupSpec, Grouping},
-    load_graph, DailiesMode, EmacsClient, EvalCtx, Graph, GraphData, OrphansMode, Query, QueryError, View,
-    ViewFilter, ViewState, ViewStore,
+    load_graph, view::notes_root_depth, DailiesMode, EmacsClient, EvalCtx, Graph, GraphData, OrphansMode, Query,
+    QueryError, View, ViewFilter, ViewState, ViewStore,
 };
 use std::time::{Duration, Instant};
 
 use crate::painter::{GraphPainter, HullDraw};
 use crate::theme::{Theme, THEMES};
+
+mod panel;
+use panel::{PanelOut, PanelState, ViewOp};
+#[cfg(test)]
+mod ui_tests;
 
 const ZOOM_MIN: f32 = 0.04;
 const ZOOM_MAX: f32 = 20.0;
@@ -16,6 +21,7 @@ const ZOOM_STEP: f32 = 1.12;
 const PAN_DECAY: f32 = 0.92;
 const BASE_DT: f32 = 1.0 / 60.0;
 const STATUS_H: f32 = 30.0;
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(600); // views.json writes after the last edit
 
 
 pub struct NaviApp {
@@ -48,6 +54,16 @@ pub struct NaviApp {
     views:       ViewStore,
     db_key:      String,                                // this db's key in views.json
     active_view: View,                                  // working copy of the active view
+    views_dirty_at: Option<Instant>,                    // unsaved edits (debounced save)
+
+    // ── side panel (backslash) ──
+    panel:         PanelState,
+    kb_focus_prev: bool,                                // a panel widget had keyboard focus last frame
+    tab_to_graph:  bool,                                // Tab cycled nodes: keep egui from focusing the panel
+    egui_busy:     bool,                                // egui asked for an immediate repaint (animation, drag)
+    visuals_for:   Option<usize>,                       // theme the egui visuals were built for
+    root_depth:    Option<(u64, usize)>,                // (view_gen, notes root depth) for the inspector
+    last_search:   String,                              // last search committed (prefills "Add group")
 
     // ── view pipeline: recomputed only when the filter, groups or graph change ──
     view_filter: ViewFilter,
@@ -139,6 +155,14 @@ impl NaviApp {
             views,
             db_key,
             active_view,
+            views_dirty_at: None,
+            panel: PanelState::default(),
+            kb_focus_prev: false,
+            tab_to_graph: false,
+            egui_busy: false,
+            visuals_for: None,
+            root_depth: None,
+            last_search: String::new(),
             view_filter,
             view: ViewState::default(),
             view_dirty: true,
@@ -232,13 +256,25 @@ impl NaviApp {
         self.graph.set_group_pull(lists, self.active_view.group_pull);
     }
 
-    /// Write the working view back into the store and save views.json.
+    /// Write the working view back into the store; views.json is saved
+    /// SAVE_DEBOUNCE after the last edit (typing a query doesn't write per key).
     fn store_view(&mut self) {
         *self.views.active_mut(&self.db_key) = self.active_view.clone();
+        self.views_dirty_at = Some(Instant::now());
+    }
+
+    /// Save views.json when an edit is pending and has settled (or now, `force`).
+    fn flush_views(&mut self, force: bool) {
+        let Some(at) = self.views_dirty_at else { return };
+        if !force && at.elapsed() < SAVE_DEBOUNCE { return; }
+        self.views_dirty_at = None;
         if let Err(e) = self.views.save() {
             self.set_msg(format!("Couldn't save {}: {e}", self.views.path.display()), Duration::from_secs(6));
         }
     }
+
+    /// The window is closing (main.rs `exiting`): write any pending edit.
+    pub fn shutdown(&mut self) { self.flush_views(true); }
 
     /// The active view's groups changed (G, Shift+G, a view switch).
     fn groups_changed(&mut self) {
@@ -248,28 +284,122 @@ impl NaviApp {
         self.refresh_view();
     }
 
-    /// Switch to view `idx` of this db (1-9, [ / ]).
+    /// Switch to view `idx` of this db (1-9, [ / ], the panel).
     fn switch_view(&mut self, idx: usize) {
         let n = self.views.views(&self.db_key).len();
         if idx >= n {
             self.popup = Some((format!("No view {}  ({n} saved)", idx + 1), self.now_secs));
             return;
         }
+        self.store_view(); // the working copy, before it's replaced
         self.views.set_active(&self.db_key, idx);
-        let _ = self.views.save();
+        self.load_active_view();
+    }
+
+    /// The store's active view became a different one (switch, new,
+    /// duplicate, delete): make it the working copy and show it.
+    fn load_active_view(&mut self) {
         self.active_view = self.views.active(&self.db_key);
         self.view_filter = self.active_view.filter(&self.cfg.dailies_dirs);
         self.group_spec  = self.active_view.spec();
         self.grouping.memory.slots = self.active_view.auto_colours.clone();
-        self.popup = Some((format!("View  {}  ({}/{n})", self.active_view.name, idx + 1), self.now_secs));
+        self.panel = PanelState::default();
+        let n = self.views.views(&self.db_key).len();
+        let k = self.views.active_index(&self.db_key);
+        self.popup = Some((format!("View  {}  ({}/{n})", self.active_view.name, k + 1), self.now_secs));
         self.filter_changed();
+        self.flush_views(true);
     }
 
-    /// A filter key changed the view: persist it and let the layout re-form
+    /// New / duplicate / rename / delete / switch from the panel.
+    fn apply_view_op(&mut self, op: ViewOp) {
+        self.store_view();
+        let key = self.db_key.clone();
+        match op {
+            ViewOp::Switch(k) => {
+                // switching from the panel keeps the panel in front of you
+                if let Some(v) = self.views.dbs.get_mut(&key).and_then(|d| d.views.get_mut(k)) { v.panel_open = true; }
+                self.switch_view(k);
+            }
+            ViewOp::New => {
+                let v = View { panel_open: true, ..View::named("View") };
+                self.views.add_view(&key, v);
+                self.load_active_view();
+            }
+            ViewOp::Duplicate => {
+                let cur = self.views.active_index(&key);
+                self.views.duplicate_view(&key, cur);
+                self.load_active_view();
+            }
+            ViewOp::Rename(name) => {
+                let cur = self.views.active_index(&key);
+                match self.views.rename_view(&key, cur, &name) {
+                    Ok(()) => {
+                        self.active_view.name = self.views.active(&key).name;
+                        self.panel.rename = None;
+                        self.panel.rename_error = None;
+                        self.flush_views(true);
+                    }
+                    Err(e) => self.panel.rename_error = Some(e),
+                }
+            }
+            ViewOp::Delete => {
+                let cur = self.views.active_index(&key);
+                if self.views.delete_view(&key, cur) {
+                    if let Some(d) = self.views.dbs.get_mut(&key) { let i = d.active_index(); d.views[i].panel_open = true; }
+                    self.load_active_view();
+                }
+            }
+        }
+    }
+
+    /// Apply what the side panel changed this frame (before the graph paints).
+    fn apply_panel(&mut self, out: PanelOut) {
+        if out.panel { self.toggle_panel(); }
+        if out.filter { self.filter_changed(); }
+        if out.groups { self.groups_changed(); }
+        if out.pull {
+            self.store_view();
+            self.apply_group_pull();
+        }
+        if out.physics { self.toggle_physics(); }
+        if let Some(i) = out.open {
+            self.open_node(i);
+            self.popup = Some(("Opening in Emacs…".into(), self.now_secs));
+        }
+        if let Some(op) = out.view_op { self.apply_view_op(op); }
+    }
+
+    fn toggle_panel(&mut self) {
+        self.active_view.panel_open = !self.active_view.panel_open;
+        self.panel.drag_from = None;
+        self.store_view();
+    }
+
+    fn toggle_physics(&mut self) {
+        if self.graph.physics_on {
+            self.graph.physics_on = false;
+            self.popup = Some(("Physics  Paused".into(), self.now_secs));
+        } else {
+            self.graph.resume_physics();
+            self.popup = Some(("Physics  Active".into(), self.now_secs));
+        }
+    }
+
+    /// Notes root depth (for paths relative to it), cached per view recompute.
+    fn notes_root(&mut self) -> usize {
+        if let Some((gen, d)) = self.root_depth { if gen == self.view_gen { return d; } }
+        let d = notes_root_depth(self.graph.node_list.iter().map(|nd| nd.file.as_str()));
+        self.root_depth = Some((self.view_gen, d));
+        d
+    }
+
+    /// A filter changed the view: persist it and let the layout re-form
     /// around what's left (Disk resumes physics; Column/Tree re-run in place).
     fn filter_changed(&mut self) {
         self.active_view.dailies = self.view_filter.dailies;
         self.active_view.orphans = self.view_filter.orphans;
+        self.active_view.links_to_dailies_count = self.view_filter.links_to_dailies_count;
         self.store_view();
         self.view_dirty = true;
         self.refresh_view();
@@ -423,6 +553,7 @@ impl NaviApp {
                 return;
             }
         };
+        self.last_search = self.search_query.trim().to_string();
         let lead = query.first_bare().unwrap_or_default();
         let cx = EvalCtx::from_view(&self.graph, &self.view);
         let mut matches: Vec<_> = self.graph.vis_idx.iter().copied()
@@ -590,6 +721,23 @@ impl NaviApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // A panel text field owns the keyboard: no graph shortcut fires. egui
+        // drops focus on Escape before this runs, so focus held LAST frame
+        // counts too: Escape leaves the field and does nothing else.
+        let typing = ctx.wants_keyboard_input() || self.kb_focus_prev;
+        let popup  = ctx.memory(|m| m.any_popup_open());
+        if typing || popup {
+            self.help_visible = false;
+            if typing && self.search_active {
+                // a click into the panel ends the search; keep it for "Add group"
+                if !self.search_query.trim().is_empty() { self.last_search = self.search_query.trim().to_string(); }
+                self.search_active = false;
+                self.search_query.clear();
+            }
+            if popup && !typing && ctx.input(|i| i.key_pressed(Key::Escape)) { ctx.memory_mut(|m| m.close_popup()); }
+            return;
+        }
+
         let held = ctx.input(|i| i.keys_down.clone());
         self.help_visible = held.contains(&Key::H);
 
@@ -606,6 +754,7 @@ impl NaviApp {
                                 Key::Escape    => { self.search_active = false; self.search_query.clear(); }
                                 Key::Enter     => { self.search_commit(); self.search_active = false; }
                                 Key::Backspace => { self.search_query.pop(); }
+                                Key::Tab       => { self.tab_to_graph = true; }
                                 _ => {}
                             }
                             continue;
@@ -616,14 +765,11 @@ impl NaviApp {
                                 self.theme_idx = (self.theme_idx + 1) % THEMES.len();
                                 self.popup = Some((THEMES[self.theme_idx].name.to_string(), self.now_secs));
                             }
-                            Key::P => {
-                                if self.graph.physics_on {
-                                    self.graph.physics_on = false;
-                                    self.popup = Some(("Physics  Paused".into(), self.now_secs));
-                                } else {
-                                    self.graph.resume_physics();
-                                    self.popup = Some(("Physics  Active".into(), self.now_secs));
-                                }
+                            Key::P => { self.toggle_physics(); }
+                            Key::Backslash => {
+                                self.toggle_panel();
+                                let open = self.active_view.panel_open;
+                                self.popup = Some((if open { "Panel  Open".into() } else { "Panel  Closed".into() }, self.now_secs));
                             }
                             Key::D => {
                                 self.view_filter.dailies = self.view_filter.dailies.toggled();
@@ -699,6 +845,7 @@ impl NaviApp {
                                 self.search_swallow_slash = true;
                             }
                             Key::Tab => {
+                                self.tab_to_graph = true; // see below the event loop
                                 // Visible nodes only, in node order
                                 let vis = &self.graph.vis_idx;
                                 if !vis.is_empty() {
@@ -737,6 +884,19 @@ impl NaviApp {
                 }
             }
         });
+        // Tab is the graph's: without this egui would also hand keyboard
+        // focus to the panel's first widget. A dummy focus holds it off for
+        // this pass; update() lets go of it once the panel is drawn. (Not
+        // inside ctx.input above: that holds the context's lock.)
+        if self.tab_to_graph { ctx.memory_mut(|m| m.request_focus(egui::Id::new("navi-graph-tab"))); }
+    }
+
+    /// Is `pos` over the side panel or one of egui's popups (colour picker,
+    /// drop-down) rather than the graph? Those never pan, select or zoom.
+    fn on_ui(&self, ctx: &egui::Context, pos: Pos2) -> bool {
+        let mut r = self.graph_rect;
+        if self.active_view.panel_open { r.max.x -= 6.0; } // the panel's resize grip reaches into the graph
+        !r.contains(pos) || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
     }
 
     fn handle_pointer(&mut self, ctx: &egui::Context) {
@@ -757,9 +917,10 @@ impl NaviApp {
         }
 
         // Hover
+        let ui_busy = ctx.is_using_pointer(); // a panel widget is being dragged
         if !self.pan_dragging && self.node_dragging.is_none() {
             if let Some(hp) = hover_pos {
-                if self.graph_rect.contains(hp) {
+                if !ui_busy && !self.on_ui(ctx, hp) {
                     let new_hov = self.node_at(hp.x, hp.y);
                     self.hovered = new_hov;
                 } else {
@@ -771,7 +932,7 @@ impl NaviApp {
         // Scroll/zoom
         if scroll.y.abs() > 0.1 {
             if let Some(hp) = hover_pos {
-                if self.graph_rect.contains(hp) {
+                if !self.on_ui(ctx, hp) {
                     let steps = (scroll.y / 20.0).clamp(-5.0, 5.0);
                     let factor = ZOOM_STEP.powf(steps);
                     let cx = self.graph_rect.center().x;
@@ -785,10 +946,10 @@ impl NaviApp {
             }
         }
 
-        // Drag start
-        if pointer.any_pressed() {
+        // Drag start (a click that closes an open popup is the popup's)
+        if pointer.any_pressed() && !ui_busy && !ctx.memory(|m| m.any_popup_open()) {
             if let Some(pos) = pointer.press_origin() {
-                if self.graph_rect.contains(pos) {
+                if !self.on_ui(ctx, pos) {
                     let hit = self.node_at(pos.x, pos.y);
                     if let Some(idx) = hit {
                         // Node drag — record offset from click point to node centre so
@@ -965,10 +1126,11 @@ impl NaviApp {
             ("  G", "Toggle group colours, hulls, pull"),
             ("  Shift-G", "Cycle auto grouping"),
             ("  1-9  /  [ ]", "Switch view"),
+            ("  \\", "Side panel: views, filters, groups, inspector"),
             ("  A", "Toggle age heatmap"),
             ("  D", "Show / hide daily notes"),
             ("  O", "Cycle orphans  (shown → hidden → only)"),
-            ("  L", "Cycle local graph (1–3 hops / off)"),
+            ("  L", "Cycle local graph (1-3 hops / off)"),
             ("  /", "Search (title, tag:, dir:, OR, -x)"),
             ("  V", "Cycle layout  (Disk → Column → Tree)"),
             ("  W", "Reload graph from database"),
@@ -1041,8 +1203,17 @@ impl NaviApp {
         if !self.window_focused {
             return false;
         }
-        self.last_active_at.elapsed() < self.idle_grace
+        // egui asked for an immediate repaint (a panel animation, a drag):
+        // honoured, but only near input, so nothing in the panel can hold the
+        // full rate while idle. Delayed requests (the text cursor's blink) are
+        // met by the ~30 fps idle tier.
+        let grace = self.last_active_at.elapsed();
+        grace < self.idle_grace || (self.egui_busy && grace < self.idle_grace + Duration::from_secs(2))
     }
+
+    /// main.rs: egui requested a repaint sooner than the idle tier would
+    /// paint (`true`) during the last frame.
+    pub fn set_egui_busy(&mut self, busy: bool) { self.egui_busy = busy; }
 
     /// Called by main.rs when the OS reports the window's focus state changes.
     /// On focus gain we immediately reset the activity clock so the next paint
@@ -1135,6 +1306,10 @@ impl NaviApp {
 
         // ── Render ────────────────────────────────────────────────────────────
         let t = self.theme();
+        if self.visuals_for != Some(self.theme_idx) {
+            ctx.set_visuals(panel::visuals(&t));
+            self.visuals_for = Some(self.theme_idx);
+        }
         let status_text = self.build_status();
 
         egui::TopBottomPanel::bottom("status")
@@ -1154,6 +1329,19 @@ impl NaviApp {
                     }
                 });
             });
+
+        // ── Side panel: drawn before the graph so the graph gets what's left;
+        //    its edits apply now, so the graph below already shows them ──
+        let out = panel::show(self, ctx);
+        self.apply_panel(out);
+        self.refresh_view();
+        self.refresh_faded();
+        self.refresh_hov_adj();
+        self.refresh_colours();
+        // the dummy focus that kept Tab on the graph has done its job
+        if std::mem::take(&mut self.tab_to_graph) { ctx.memory_mut(|m| m.stop_text_input()); }
+        self.kb_focus_prev = ctx.wants_keyboard_input();
+        self.flush_views(false);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(t.bg))
@@ -1204,7 +1392,7 @@ impl NaviApp {
                 let t_labels = Instant::now();
                 if !no_labels && self.zoom > 0.25 { gp.paint_labels(&painter); }
                 let t_help   = Instant::now();
-                if self.active_view.colour_groups { self.paint_legend(&painter, graph_rect, t); }
+        if self.active_view.colour_groups { self.paint_legend(&painter, graph_rect, t); }
                 if self.help_anim > 0.01 { self.paint_help(&painter, graph_rect, t); }
                 let t_end    = Instant::now();
 

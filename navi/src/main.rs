@@ -158,6 +158,10 @@ struct AppState {
     last_frame: Instant,
     last_fps_log: Option<Instant>,
 
+    // Set by egui's repaint callback when a widget asks to be repainted
+    // sooner than the idle tier paints (an animation, a drag in the panel).
+    egui_wants_frames: Arc<std::sync::atomic::AtomicBool>,
+
     // Wall-clock of the last actual paint. Used to coalesce back-to-back
     // redraw triggers (e.g. a Vsync user-event arriving microseconds after a
     // RedrawRequested from a focus/input event). At 240 Hz the vsync window is
@@ -192,6 +196,7 @@ impl AppState {
             last_frame: Instant::now(),
             last_fps_log: None,
             last_paint_at: None,
+            egui_wants_frames: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -224,6 +229,13 @@ impl ApplicationHandler<UserEvent> for AppState {
 
         let egui_glow = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
         setup_fonts(&egui_glow.egui_ctx);
+        // Widgets' repaint requests don't trigger paints (vsync / the idle
+        // timer do); a request sooner than the idle tier only tells the app
+        // to stay at full rate for the next frame (needs_full_speed bounds it).
+        let wants = self.egui_wants_frames.clone();
+        egui_glow.egui_ctx.set_request_repaint_callback(move |info| {
+            if info.delay < Duration::from_millis(33) { wants.store(true, std::sync::atomic::Ordering::Relaxed); }
+        });
 
         // Spawn the display link on a dedicated bg thread. From there it sends
         // `UserEvent::Vsync` to the main thread on every tick. The link is
@@ -367,6 +379,10 @@ impl ApplicationHandler<UserEvent> for AppState {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // views.json saves are debounced: write a pending edit before going
+        if let Some(app) = self.app.as_mut() {
+            app.shutdown();
+        }
         if let Some(eg) = self.egui_glow.as_mut() {
             eg.destroy();
         }
@@ -414,8 +430,9 @@ impl AppState {
             self.frame_times.pop_front();
         }
 
-        let needs_full_speed = match self.app.as_ref() {
-            Some(a) => a.needs_full_speed(),
+        let egui_busy = self.egui_wants_frames.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let needs_full_speed = match self.app.as_mut() {
+            Some(a) => { a.set_egui_busy(egui_busy); a.needs_full_speed() }
             None => false,
         };
 

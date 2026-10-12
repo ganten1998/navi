@@ -63,6 +63,8 @@ pub struct View {
     pub group_pull:             f64,                        // centroid spring strength for pulling groups
     #[serde(default, alias = "auto_colors")]
     pub auto_colours:           BTreeMap<String, u8>,       // palette slot per auto-group key (stable colours)
+    #[serde(default)]
+    pub panel_open:             bool,                       // the side panel (backslash key) is open in this view
 }
 
 impl Default for View {
@@ -71,7 +73,7 @@ impl Default for View {
             name: default_name(), groups: Vec::new(), auto: AutoGrouper::None, auto_hidden: Vec::new(),
             auto_pull: false, auto_hull: false, colour_groups: false,
             dailies: DailiesMode::Show, orphans: OrphansMode::Show, links_to_dailies_count: true,
-            group_pull: DEFAULT_PULL, auto_colours: BTreeMap::new(),
+            group_pull: DEFAULT_PULL, auto_colours: BTreeMap::new(), panel_open: false,
         }
     }
 }
@@ -267,6 +269,60 @@ impl ViewStore {
 
     pub fn active(&mut self, key: &str) -> View { self.active_mut(key).clone() }
 
+    // ── managing views (the side panel) ──
+
+    /// `base`, or `base 2`, `base 3`, … : a name no view of `key` has
+    /// (`except` = the index of a view being renamed, which may keep its own).
+    pub fn unique_name(&self, key: &str, base: &str, except: Option<usize>) -> String {
+        let base  = base.trim();
+        let base  = if base.is_empty() { "View" } else { base };
+        let taken = |n: &str| self.views(key).iter().enumerate().any(|(k, v)| Some(k) != except && v.name == n);
+        if !taken(base) { return base.to_string(); }
+        (2..).map(|k| format!("{base} {k}")).find(|n| !taken(n)).expect("unbounded")
+    }
+
+    /// Append `view` (its name made unique) and make it active. Its index.
+    pub fn add_view(&mut self, key: &str, mut view: View) -> usize {
+        view.name = self.unique_name(key, &view.name, None);
+        let db = self.dbs.entry(key.to_string()).or_default();
+        db.active = view.name.clone();
+        db.views.push(view);
+        db.views.len() - 1
+    }
+
+    /// A copy of view `idx` right after it, named "<name> copy", made active.
+    pub fn duplicate_view(&mut self, key: &str, idx: usize) -> Option<usize> {
+        let mut v = self.views(key).get(idx)?.clone();
+        v.name = self.unique_name(key, &format!("{} copy", v.name), None);
+        let db = self.dbs.get_mut(key)?;
+        db.active = v.name.clone();
+        db.views.insert(idx + 1, v);
+        Some(idx + 1)
+    }
+
+    /// Rename view `idx`. An empty or taken name is refused with the reason.
+    pub fn rename_view(&mut self, key: &str, idx: usize, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() { return Err("A view needs a name".into()); }
+        if self.unique_name(key, name, Some(idx)) != name { return Err(format!("There is already a view called \"{name}\"")); }
+        let db = self.dbs.get_mut(key).ok_or("No views for this db")?;
+        let v  = db.views.get_mut(idx).ok_or("No such view")?;
+        if db.active == v.name { db.active = name.to_string(); }
+        v.name = name.to_string();
+        Ok(())
+    }
+
+    /// Delete view `idx`; the last view of a db is never deleted. When it was
+    /// active, its neighbour (the next one, else the previous) becomes active.
+    pub fn delete_view(&mut self, key: &str, idx: usize) -> bool {
+        let Some(db) = self.dbs.get_mut(key) else { return false };
+        if db.views.len() <= 1 || idx >= db.views.len() { return false; }
+        let was_active = db.active_index() == idx;
+        db.views.remove(idx);
+        if was_active { db.active = db.views[idx.min(db.views.len() - 1)].name.clone(); }
+        true
+    }
+
     /// Switch to view `idx` (no-op past the end). True when it changed.
     pub fn set_active(&mut self, key: &str, idx: usize) -> bool {
         let Some(db) = self.dbs.get_mut(key) else { return false };
@@ -396,6 +452,45 @@ mod tests {
         // a db that already has views is never re-seeded
         assert!(!s.ensure_db("/x.db", Some(&LegacyView { orphans: Some(OrphansMode::Hide), ..LegacyView::default() })));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manage_views() {
+        let mut s = ViewStore::default();
+        s.ensure_db("/a.db", None);
+        assert_eq!(s.unique_name("/a.db", "Default", None), "Default 2");
+        assert_eq!(s.unique_name("/a.db", "Default", Some(0)), "Default", "renaming to its own name");
+        assert_eq!(s.unique_name("/a.db", "  ", None), "View");
+
+        let w = s.add_view("/a.db", View::named("Default"));
+        assert_eq!((w, s.views("/a.db")[1].name.as_str()), (1, "Default 2"));
+        assert_eq!(s.active_index("/a.db"), 1, "a new view becomes active");
+
+        s.active_mut("/a.db").orphans = OrphansMode::Only;
+        assert_eq!(s.duplicate_view("/a.db", 1), Some(2));
+        assert_eq!(s.views("/a.db")[2].name, "Default 2 copy");
+        assert_eq!(s.views("/a.db")[2].orphans, OrphansMode::Only, "a copy keeps everything");
+        assert_eq!(s.active_index("/a.db"), 2);
+        assert_eq!(s.duplicate_view("/a.db", 9), None);
+
+        assert!(s.rename_view("/a.db", 2, "Default").is_err(), "taken");
+        assert!(s.rename_view("/a.db", 2, " ").is_err(), "empty");
+        s.rename_view("/a.db", 2, " Writing ").unwrap();
+        assert_eq!(s.views("/a.db")[2].name, "Writing");
+        assert_eq!(s.db("/a.db").unwrap().active, "Writing", "renaming the active view keeps it active");
+        s.rename_view("/a.db", 0, "Default").unwrap();
+
+        // deleting the active view activates its neighbour; the last view stays
+        assert!(s.delete_view("/a.db", 2));
+        assert_eq!(s.db("/a.db").unwrap().active, "Default 2");
+        assert!(s.delete_view("/a.db", 0));
+        assert_eq!(s.active_index("/a.db"), 0);
+        assert_eq!(s.views("/a.db")[0].name, "Default 2");
+        assert!(!s.delete_view("/a.db", 0), "never the last one");
+        assert!(!s.delete_view("/none.db", 0));
+        // panel_open round-trips and defaults to closed
+        let v: View = serde_json::from_str(r#"{"name": "x", "panel_open": true}"#).unwrap();
+        assert!(v.panel_open && !View::default().panel_open);
     }
 
     #[test]

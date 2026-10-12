@@ -126,6 +126,17 @@ pub fn parse_hex(s: &str) -> Option<[u8; 3]> {
 
 pub fn to_hex(c: [u8; 3]) -> String { format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]) }
 
+/// A colour for a new manual group: the first palette entry (for `bg`) no
+/// existing group uses, starting from the name's hash slot; when all are
+/// taken, the hash slot itself. Stored on the group, so it never shifts.
+pub fn new_group_colour(groups: &[Group], name: &str, bg: [u8; 3]) -> [u8; 3] {
+    let pal  = palette(bg);
+    let used: Vec<[u8; 3]> = groups.iter()
+        .map(|g| g.colour.unwrap_or_else(|| GroupColour::Slot(hash_slot(&format!("manual:{}", g.name))).rgb(bg))).collect();
+    let h = hash_slot(&format!("manual:{name}")) as usize;
+    (0..PALETTE_LEN).map(|d| pal[(h + d) % PALETTE_LEN]).find(|c| !used.contains(c)).unwrap_or(pal[h])
+}
+
 // ── Colour memory (keyed auto groups) ─────────────────────────────────────────
 
 /// Slot per auto-group key. A known key keeps its slot; new keys (in sorted
@@ -1118,6 +1129,28 @@ mod tests {
         assert_eq!(to_hex([255, 128, 0]), "#ff8000");
         assert_eq!(stable_hash("tag:rust"), stable_hash("tag:rust"));
         assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325, "FNV-1a offset basis: the hash never changes");
+    }
+
+    #[test]
+    fn new_groups_get_distinct_stored_colours() {
+        let bg = [0x10, 0x1e, 0x2e];
+        let mut gs: Vec<Group> = Vec::new();
+        for k in 0..PALETTE_LEN {
+            let name = format!("Group {k}");
+            let mut g = Group::new(&name, "");
+            g.colour = Some(new_group_colour(&gs, &name, bg));
+            gs.push(g);
+        }
+        let mut c: Vec<[u8; 3]> = gs.iter().map(|g| g.colour.unwrap()).collect();
+        c.sort(); c.dedup();
+        assert_eq!(c.len(), PALETTE_LEN, "the whole palette before any repeat");
+        assert!(c.iter().all(|x| palette(bg).contains(x)));
+        // full palette: falls back to the hash slot, no panic
+        assert!(palette(bg).contains(&new_group_colour(&gs, "One more", bg)));
+        // a group without a stored colour still counts as using its hash colour
+        let implicit = vec![Group::new("Rust", "tag:rust")];
+        let theirs = GroupColour::Slot(hash_slot("manual:Rust")).rgb(bg);
+        assert_ne!(new_group_colour(&implicit, "Rust", bg), theirs);
     }
 
     #[test]

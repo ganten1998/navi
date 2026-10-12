@@ -113,7 +113,7 @@ pub fn install_bg_link(window: &winit::window::Window, proxy: EventLoopProxy<Use
             f
         }
         None => {
-            eprintln!("navi: could not query NSScreen.maximumFramesPerSecond — defaulting to 240 Hz");
+            eprintln!("navi: could not query NSScreen.maximumFramesPerSecond; defaulting to 240 Hz");
             240.0
         }
     };
@@ -179,7 +179,7 @@ fn run_bg_link(max_fps: f32) {
         let screen: &NSScreen = match screen_opt.as_deref() {
             Some(s) => s,
             None => {
-                eprintln!("navi: bg-thread display link could not find an NSScreen — pacer disabled");
+                eprintln!("navi: bg-thread display link could not find an NSScreen; pacer disabled");
                 return;
             }
         };

@@ -102,7 +102,7 @@ The legacy config path `~/.config/org-roam-graph/config.json` is also read; the 
 
 ## Views and groups
 
-A **view** is a named set of filters and groups. Views are stored per org-roam db (keyed by its canonical path) in `~/.config/navi/views.json`, and navi remembers which view was last active for each db. `1` to `9` switch to a view by position, `[` and `]` step through them.
+A **view** is a named set of filters and groups. Views are stored per org-roam db (keyed by its canonical path) in `~/.config/navi/views.json`, and navi remembers which view was last active for each db. `1` to `9` switch to a view by position, `[` and `]` step through them. Everything below can be edited in the [side panel](#side-panel); editing `views.json` by hand works too.
 
 A **group** is a query plus how it's shown: a colour (always), and per group whether it is `visible`, whether it `pull`s its members together (a soft spring toward the group's centroid; off by default) and whether it draws a `hull` (a faint padded outline behind its nodes, labelled at their centre).
 
@@ -166,7 +166,21 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | `group_pull` | Strength of `pull` (default `0.1`, a slow drift; `0.5` makes tight clusters; at most `1.0`). |
 | `auto_colours` | Written by navi: the palette slot each folder / tag / file group got, so colours survive restarts. |
 
-Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Writes are atomic.
+Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Writes are atomic, and happen shortly after the last change (and on exit), so typing in the panel doesn't write once per key. `panel_open` (written by navi) remembers whether the side panel is open in that view.
+
+### Side panel
+
+`\` opens and closes a panel on the right. It's resizable, takes its colours from the theme, and each view remembers whether it's open. Changes show on the graph immediately and are saved to `views.json`.
+
+| Section | What's there |
+|---|---|
+| View | Every view of this db, the active one marked; click one to switch to it. New, Duplicate, Rename, Delete (asks first; the last view can't be deleted). |
+| Filters | Dailies show / hide, orphans show / hide / only, "links to dailies count", and live counts: visible nodes and links, orphans in view (and in the db), isolated by filters, daily-only, hidden by groups, dangling links. |
+| Groups | "Show groups" (`G`). The manual groups, first = highest precedence: drag a row by its handle (the dots on the left) or use the arrow buttons to reorder. Each row: colour (click to pick), name, how many nodes match, the query (an error and its column show underneath), Visible / Pull / Hull, and delete. "Add group" starts from the search you're typing, or the last one you ran. "Group by" chooses the automatic grouper and its setting (folder depth, community resolution, communities computed on all links or only the visible graph), Pull / Hull for all automatic groups, and a list of them with a checkbox each to hide it. |
+| Physics | Group pull strength (0.1 drifts, 0.5 clusters tightly) and pause / resume. |
+| Inspector | The selected node: title, file relative to the notes root, tags, aliases, links in view and in the db, orphan status (no links at all, isolated by filters, or daily-only), its dangling links, and every group it's in with the one that gives its colour marked. "Open in Emacs". |
+
+While a text field in the panel has the keyboard, no shortcut fires (typing `d` in a query doesn't hide dailies); `Escape` leaves the field first, and a click on the graph does too. `Tab` keeps cycling nodes. Clicks, drags and scrolling over the panel stay in the panel: they never pan, select or zoom the graph, and the graph is laid out, fitted and hit-tested in the space left of it.
 
 ### Query language
 
@@ -217,7 +231,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | Swipe + release | Kinetic pan (momentum) |
 | Drag node | Move node |
 | Scroll / trackpad | Zoom toward cursor |
-| Click node | Select, highlights connections (the status bar lists its groups) |
+| Click node | Select, highlights connections (the status bar lists its groups; the panel's inspector shows the rest) |
 | Double-click node | Open in Emacs |
 | `Tab` / `Shift-Tab` | Cycle visible nodes |
 | `Enter` / `Space` | Open selected node |
@@ -225,6 +239,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | `G` | Group display on / off (colours, hulls, pull, legend) |
 | `Shift-G` | Cycle the automatic grouper: none → folder → tag → component → community → file |
 | `1` to `9` | Switch to view 1 to 9 |
+| `\` | Open / close the [side panel](#side-panel) |
 | `[` / `]` | Previous / next view |
 | `A` | Toggle age / weathering heatmap |
 | `D` | Show / hide daily notes (saved in the view) |
@@ -236,7 +251,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | `F` | Toggle FPS counter |
 | `P` | Pause / resume physics |
 | `R` | Reset view |
-| `H` | Hold to show controls panel (plus orphan and unresolved-link counts) |
+| `H` | Hold to show the controls overlay (plus orphan and unresolved-link counts) |
 | `Q` / `Escape` | Quit |
 
 ---
@@ -284,6 +299,8 @@ navi-core/                Pure-Rust library: config, org-roam DB loader, view pi
 navi/                     Binary: UI, rendering, event loop
   src/main.rs             winit + glutin event loop, paint pacer
   src/app.rs              egui app: input, layout, views, search, status bar, legend
+  src/app/panel.rs        Side panel: views, filters, groups, physics, inspector
+  src/app/ui_tests.rs     Headless frames through the app: panel keyboard / pointer rules
   src/painter.rs          GraphPainter: grid, group hulls, edges, nodes, labels
   src/macos_display.rs    macOS CADisplayLink + tier control
   src/theme.rs            Colour themes

@@ -3,7 +3,8 @@
 //! (path: $ORG_ROAM_DB, else ~/.emacs.d/org-roam.db).
 
 use navi_core::groups::{AutoGrouper, CommunityScope, GroupSpec, Grouping};
-use navi_core::{compute_view, load_graph, DailiesMode, EvalCtx, Graph, OrphansMode, Query, ViewFilter};
+use navi_core::view::{notes_root_depth, relative_to_root};
+use navi_core::{compute_view, load_graph, DailiesMode, EvalCtx, Graph, OrphanKind, OrphansMode, Query, ViewFilter};
 
 fn db_path() -> String {
     std::env::var("ORG_ROAM_DB").unwrap_or_else(|_| navi_core::config::expand_tilde("~/.emacs.d/org-roam.db"))
@@ -31,7 +32,20 @@ fn probe_real_db() {
         for i in 0..v.visible.len() {
             if v.visible[i] && orphans == OrphansMode::Hide { assert!(v.visible_degree[i] > 0); }
         }
+        // the inspector's per-node orphan wording adds up to the counts
+        let kinds: Vec<OrphanKind> = (0..v.visible.len()).map(|i| v.orphan_kind(i)).collect();
+        let n = |k: OrphanKind| kinds.iter().filter(|&&x| x == k).count();
+        assert_eq!(n(OrphanKind::IsolatedByFilters), v.counts.isolated_by_filters);
+        assert_eq!(n(OrphanKind::DailyOnly), v.counts.daily_only);
+        assert_eq!(v.counts.orphans_in_view, kinds.len() - n(OrphanKind::Linked));
     }
+    // file paths as the inspector shows them: relative to the notes root
+    let root = notes_root_depth(g.node_list.iter().map(|nd| nd.file.as_str()));
+    let mut rel: Vec<String> = g.node_list.iter().map(|nd| relative_to_root(&nd.file, root)).collect();
+    rel.sort();
+    let nested = rel.iter().filter(|r| r.contains('/')).count();
+    println!("relative paths: {} flat, {nested} in folders; e.g. {:?}", rel.len() - nested, rel.iter().find(|r| r.contains('/')));
+    assert!(rel.iter().all(|r| !r.starts_with('/')));
 }
 
 /// Group counts per automatic grouper on the real db, plus a few queries.

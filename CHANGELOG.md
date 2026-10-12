@@ -2,10 +2,40 @@
 
 All notable changes to Navi are documented here.
 
-## [Unreleased]
+## [1.1.0] - 2026-10-12
 
 ### Added
 
+- **Side panel** (`\` toggles it; resizable, coloured by the active theme,
+  and each view remembers whether it's open). Its sections:
+  - **View**: every view of this db with the active one marked; switch,
+    new, duplicate, rename, and delete (asked inline first; the last view
+    stays).
+  - **Filters**: dailies show / hide, orphans show / hide / only,
+    "links to dailies count", and live counts (visible nodes and links,
+    orphans in view and in the db, isolated by filters, daily-only, hidden
+    by groups, dangling links).
+  - **Groups**: the manual groups in precedence order. Drag a row by its
+    handle (or use the arrow buttons) to reorder. Each row has a colour
+    picker, its name, its query (a parse error shows right under it), how
+    many nodes match, and visible / pull / hull switches; a group can be
+    deleted. "Add group" starts from the search being typed (or the last
+    one searched). "Group by" picks the automatic grouper with its
+    setting (folder depth, community resolution, communities computed on
+    all links or on what's visible), switches pull and hull for every
+    automatic group, and lists the automatic groups so each can be hidden.
+  - **Physics**: the group pull strength, and pause / resume.
+  - **Inspector** for the selected node: title, file (relative to the
+    notes root), tags, aliases, links in view and in the db, orphan status
+    (no links at all, isolated by filters, or daily-only), its dangling
+    links, and every group it's in, marking the one that gives its colour.
+
+  Every edit shows on the graph at once and is saved to `views.json`. While
+  a panel field has the keyboard no shortcut fires, and `Escape` leaves the
+  field first; `Tab` still cycles nodes. Clicks, drags and scrolling over
+  the panel or its pop-ups never pan, select or zoom the graph, and the
+  graph, its fit and hit-testing use the space left of the panel. The panel
+  doesn't keep the app at full frame rate: it idles like the rest.
 - **Groups**: a group is a query with a colour and three switches:
   visible, pull (members drift toward their centroid; off by default) and
   hull (a faint outline behind its nodes). Manual groups are an ordered
@@ -42,12 +72,11 @@ All notable changes to Navi are documented here.
   and unresolved-link counts. With `links_to_dailies_count: false`, notes
   linked only to dailies count as orphans ("daily-only"); a daily linked to
   a connected note does not.
-- **Filters persist**: the dailies and orphan modes are saved to
-  `config.json` (`dailies`, `orphans`), plus two new keys: `dailies_dirs`
-  (which directory names mark a daily) and `links_to_dailies_count`. Old
-  config files load unchanged, the modes read back in any case (and as
-  `"shown"` / `"hidden"`), and a bad value resets only its own key instead
-  of the whole file.
+- **Filters persist** in the view (see Changed), with a new view key,
+  `links_to_dailies_count`, and a new `config.json` key, `dailies_dirs`
+  (which directory names mark a daily). The modes read back in any case
+  (and as `"shown"` / `"hidden"`), and a bad value in `config.json` resets
+  only its own key instead of the whole file.
 - **Unresolved links are counted**: `fuzzy` links and `id:` links to a
   missing node used to vanish silently; they're now kept as dangling links
   and counted (help panel, startup log).
@@ -66,6 +95,8 @@ All notable changes to Navi are documented here.
   is written. `config.json` is now saved atomically too.
 - Group pull is weak by default (`group_pull: 0.1`) so links between groups
   stay readable; it pauses like the rest of the physics once things settle.
+- `views.json` is written shortly after the last edit (typing a query
+  doesn't write once per key) and again on exit; every write is atomic.
 
 ### Fixed
 
@@ -97,47 +128,47 @@ All notable changes to Navi are documented here.
   filter no longer lays the graph out twice at startup, and an empty graph
   (no db yet) lets the app idle instead of rendering at full rate.
 
-## [1.0.0] — 2026-05-20, re-released 2026-07-28
+## [1.0.0] - 2026-05-20, re-released 2026-07-28
 
 The 2026-07-28 re-release (same version, tag recut) makes the app fully
 cross-platform and fixes several bugs found while porting:
 
-### Re-release — Added
+### Re-release: Added
 
-- **Linux support (X11 + Wayland, one binary)** — winit's Linux backends are now
+- **Linux support (X11 + Wayland, one binary)**: winit's Linux backends are now
   enabled; pacing via blocking `SwapInterval::Wait(1)` swaps on X11 / a
   refresh-rate timer on Wayland (blocking swaps can freeze there when a
   compositor withholds frame callbacks). Sets `WM_CLASS` / `app_id` to `navi`
   for i3/sway rules; pre-built x86_64 + aarch64 glibc binaries with a
   `navi.desktop` file ship with the release.
-- **Windows support** — talks to the Emacs server via its native TCP
+- **Windows support**: talks to the Emacs server via its native TCP
   `server-file` (with the `%APPDATA%` home resolution stock Emacs uses), finds
   `emacsclientw.exe` across official/Chocolatey/Scoop/MSYS2 installs, builds as
   a GUI-subsystem app (no console window; parent console re-attached for
   debug flags; panics surface in a dialog), db auto-detection probes
   `%APPDATA%`, and a pre-built x64 exe ships with the release.
-- **`borderless` config option** — implemented (it existed in the config schema
+- **`borderless` config option**: implemented (it existed in the config schema
   but was never applied); default is a normal decorated window, which tiling
   WMs (AeroSpace, i3) can actually manage.
 - **Window icon on X11/Windows**, per-OS font fallback chains (CJK via `.ttc`
   collections on Windows/Linux), HiDPI initial-size clamp, and a friendly
   in-window message (instead of a silent exit) when no org-roam db is found.
 
-### Re-release — Fixed
+### Re-release: Fixed
 
-- **Startup race that froze the app** — the CADisplayLink activation could be
+- **Startup race that froze the app**: the CADisplayLink activation could be
   requested before the background thread published the link; the resume was
   dropped and no frame was ever painted. Also added a fallback wake-up so a
   stalled pacer can never freeze the UI again.
-- **App never activated on macOS** — the process never registered as a regular
+- **App never activated on macOS**: the process never registered as a regular
   activated app, so the window got no keyboard focus and AX-based tools
   (AeroSpace, yabai) didn't even list it.
-- **Search input was dead** — the key handler swallowed the `Text` events that
+- **Search input was dead**: the key handler swallowed the `Text` events that
   follow each keypress, so `/` seeded the query with a slash and typed
   characters never registered.
-- **CJK crash** — selecting a node with a long multi-byte title panicked on a
+- **CJK crash**: selecting a node with a long multi-byte title panicked on a
   byte-sliced truncation.
-- **Startup fit under tiling WMs** — the initial zoom/center assumed a
+- **Startup fit under tiling WMs**: the initial zoom/center assumed a
   1400×870 viewport; now re-fits to the real first-frame size, and `R` uses
   the live viewport too.
 - Lisp string unescaping for titles/files/aliases (quoted tags are now
@@ -147,31 +178,31 @@ cross-platform and fixes several bugs found while porting:
   GL teardown), emacsclient children are reaped (no zombies), and `~` in the
   configured `emacsclient` path expands.
 
-## Original release notes — 2026-05-20
+## Original release notes, 2026-05-20
 
 Full ground-up rewrite from Python (pygame + ModernGL) to Rust (egui + glow). Same conceptual feature set, dramatically better performance and packaging. The previous Python release is superseded and unsupported.
 
 ### Added
 
-- **Rust workspace** — `navi-core` (pure library: config, db loader, graph, physics) + `navi` (egui UI binary).
-- **Native event loop** — direct `winit` + `glutin` + `egui_glow`, replacing eframe. Gives Navi full control over the paint cadence.
-- **Vsync-aligned 240 Hz pacer (macOS)** — dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`. Each vsync sends a `UserEvent::Vsync` to the main loop via `EventLoopProxy`; mouse/keyboard events never trigger redraws. Result: locked 4.17 ms frame interval on a 240 Hz display with no missed vsyncs in steady state.
-- **Idle grace window** — after ~10 s of inactivity (configurable via `NAVI_IDLE_GRACE_SECS`) the display link pauses and the OS drops the panel tier; the next input or focus event resumes within one frame.
-- **Paint coalescing** — duplicate redraw triggers (e.g. a Vsync arriving microseconds after a focus-driven redraw) within half a vsync interval are dropped, preventing compositor-slot contention that produced 8–14 ms worst-case frames.
-- **`NAVI_FPS_LOG=1`** — stderr probe printing fps, avg/worst frame ms, deque size, and display-link metadata once per second.
-- **`NAVI_PROF=1`** — per-layer paint timing (grid / edges / nodes / labels / help).
-- **Graph rendering via egui's tessellator + glow** — single-pass painter with grid, edges, nodes, labels, particle effects, and help overlay.
-- **Themes** — Obsidian / Forest / Ocean / Ember / Mono, cycled with `T`.
-- **Layouts** — force-directed (default) + alternates cycled with `V`.
-- **Search** — `/` to search nodes by title or alias.
-- **Local-graph mode** — `L` cycles 1 → 2 → 3 hops → off.
-- **Filters** — `D` (daily notes) and `O` (orphans).
-- **Tag colouring** — `G`; reads org-roam's `tags` table, golden-ratio hue spacing.
-- **Age heatmap** — `A`; visualises file mtime in 6 stages.
-- **Headline-level nodes** — open jumps to heading position via `goto-char`.
-- **emacsclient discovery** — Homebrew, MacPorts, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`, `~/.nix-profile/bin`, NixOS, Snap, `/Applications/Emacs.app`.
-- **Emacs socket discovery** — `$EMACS_SERVER_SOCKET`, `$XDG_RUNTIME_DIR/emacs/`, `$TMPDIR/emacs{uid}/`, `/tmp`, `/private/tmp`, and `/var/folders/.../T/emacs{uid}/` (fixes GUI vs Terminal `TMPDIR` mismatch on macOS).
-- **DB auto-detection** — vanilla Emacs, XDG, Doom 2.x / 3.x, Spacemacs.
+- **Rust workspace**: `navi-core` (pure library: config, db loader, graph, physics) + `navi` (egui UI binary).
+- **Native event loop**: direct `winit` + `glutin` + `egui_glow`, replacing eframe. Gives Navi full control over the paint cadence.
+- **Vsync-aligned 240 Hz pacer (macOS)**: dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`. Each vsync sends a `UserEvent::Vsync` to the main loop via `EventLoopProxy`; mouse/keyboard events never trigger redraws. Result: locked 4.17 ms frame interval on a 240 Hz display with no missed vsyncs in steady state.
+- **Idle grace window**: after ~10 s of inactivity (configurable via `NAVI_IDLE_GRACE_SECS`) the display link pauses and the OS drops the panel tier; the next input or focus event resumes within one frame.
+- **Paint coalescing**: duplicate redraw triggers (e.g. a Vsync arriving microseconds after a focus-driven redraw) within half a vsync interval are dropped, preventing compositor-slot contention that produced 8–14 ms worst-case frames.
+- **`NAVI_FPS_LOG=1`**: stderr probe printing fps, avg/worst frame ms, deque size, and display-link metadata once per second.
+- **`NAVI_PROF=1`**: per-layer paint timing (grid / edges / nodes / labels / help).
+- **Graph rendering via egui's tessellator + glow**: single-pass painter with grid, edges, nodes, labels, particle effects, and help overlay.
+- **Themes**: Obsidian / Forest / Ocean / Ember / Mono, cycled with `T`.
+- **Layouts**: force-directed (default) + alternates cycled with `V`.
+- **Search**: `/` to search nodes by title or alias.
+- **Local-graph mode**: `L` cycles 1 → 2 → 3 hops → off.
+- **Filters**: `D` (daily notes) and `O` (orphans).
+- **Tag colouring**: `G`; reads org-roam's `tags` table, golden-ratio hue spacing.
+- **Age heatmap**: `A`; visualises file mtime in 6 stages.
+- **Headline-level nodes**: open jumps to heading position via `goto-char`.
+- **emacsclient discovery**: Homebrew, MacPorts, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`, `~/.nix-profile/bin`, NixOS, Snap, `/Applications/Emacs.app`.
+- **Emacs socket discovery**: `$EMACS_SERVER_SOCKET`, `$XDG_RUNTIME_DIR/emacs/`, `$TMPDIR/emacs{uid}/`, `/tmp`, `/private/tmp`, and `/var/folders/.../T/emacs{uid}/` (fixes GUI vs Terminal `TMPDIR` mismatch on macOS).
+- **DB auto-detection**: vanilla Emacs, XDG, Doom 2.x / 3.x, Spacemacs.
 
 ### Removed
 
