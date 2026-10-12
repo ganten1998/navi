@@ -7,7 +7,8 @@
 #   ARCH=universal scripts/build-macos.sh # arm64 + x86_64 universal binary
 #
 # Output: dist/Navi.app  and  dist/Navi-<version>-<arch>.zip (an ad-hoc build
-# is packaged as Navi-<version>-<arch>-adhoc.zip, never under the release name)
+# is packaged as Navi-<version>-<arch>-adhoc.zip and an unnotarized one as
+# Navi-<version>-<arch>-unnotarized.zip, never under the release name)
 #
 # Environment:
 #   NAVI_SIGN_ID              codesign identity (unset: the first installed
@@ -16,6 +17,7 @@
 #                             notarization, NOT release-grade)
 #   NAVI_NOTARY_PROFILE       notarytool keychain profile (default: tangent-notary)
 #   NAVI_ALLOW_UNNOTARIZED=1  package a signed app even when notarization failed
+#                             (as ...-unnotarized.zip)
 #   CARGO_TARGET_DIR          respected; defaults to ~/.cache/navi-target when
 #                             the repo lives in Dropbox (it breaks cargo linking)
 #   MACOSX_DEPLOYMENT_TARGET  default 14.0; also written as LSMinimumSystemVersion
@@ -76,6 +78,11 @@ case "$ARCH" in
     [ -n "$TOOLCHAIN_BIN" ] || TOOLCHAIN_BIN="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin"
     [ ! -d "$TOOLCHAIN_BIN" ] || export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
     rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
+    # Some rustc releases (1.97) strip host proc-macro dylibs built for
+    # macOS 13+ into a LINKEDIT string pool dyld refuses to load ("mis-aligned
+    # LINKEDIT string pool", then E0463 can't find crate for serde_derive).
+    # Proc macros run only on this machine: leave them unstripped.
+    export CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=false
     cargo build --release -p navi --target x86_64-apple-darwin
     cargo build --release -p navi --target aarch64-apple-darwin
     mkdir -p "$TARGET_DIR/universal/release"
@@ -94,7 +101,8 @@ esac
 echo "==> Assembling $APP"
 # The bundle only: the old zip stays until a new one is ready to replace it,
 # so a failed sign or notarization does not destroy the last good artifact
-# (an ad-hoc build never replaces it either: it is packaged under -adhoc).
+# (an ad-hoc or unnotarized build never replaces it either: it is packaged
+# under -adhoc / -unnotarized).
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -303,7 +311,9 @@ fi
 # dist/Navi.app stays built either way. Ad-hoc builds already said what they are.
 if [ "$SIGNED_RELEASE" = 1 ] && [ "$NOTARIZED" = 0 ]; then
   if [ "${NAVI_ALLOW_UNNOTARIZED:-0}" = 1 ]; then
-    echo "warn: PACKAGING AN UNNOTARIZED RELEASE (NAVI_ALLOW_UNNOTARIZED=1)."
+    # never under the release name: the last notarized zip stays where it is
+    ZIP="dist/Navi-${VERSION}-${ZIP_ARCH}-unnotarized.zip"
+    echo "warn: PACKAGING AN UNNOTARIZED RELEASE (NAVI_ALLOW_UNNOTARIZED=1) as $ZIP."
     echo "      This zip will be refused by Gatekeeper on every Mac but this one."
   else
     echo "!! Refusing to package. dist/Navi.app is built but not notarized." >&2

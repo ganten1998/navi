@@ -32,11 +32,15 @@ pub struct Config {
     pub keep_file:              bool,
 }
 
-/// The view filters an older config.json carried.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The view filters an older config.json carried (views.json keeps them as
+/// `legacy_filters`, the seed of every db's first view).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dailies:                Option<DailiesMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphans:                Option<OrphansMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub links_to_dailies_count: Option<bool>,
 }
 

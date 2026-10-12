@@ -80,9 +80,7 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
 
 A bad value in any key falls back to that key's default alone; the rest of the file is kept, and the original is first copied to `config.json.bad`. A config.json that can't be read or isn't JSON at all (a trailing comma after a hand edit) is never written over: navi runs on defaults for that session and leaves the file for you to fix. Saves are atomic (a temp file renamed into place), and a config.json that is a symlink (into a dotfiles repo, say) is written through: the link stays a link.
 
-The filters `dailies`, `orphans` and `links_to_dailies_count` used to live here. They now belong to a [view](#views-and-groups): on the first run with a db that has no views yet, its `Default` view takes whatever values config.json had, and only once `views.json` holding them is written are the keys dropped from config.json.
-
-The legacy config path `~/.config/org-roam-graph/config.json` is also read; the next save writes to the new path.
+The filters `dailies`, `orphans` and `links_to_dailies_count` used to live here. They now belong to a [view](#views-and-groups): on the first run they move to the top of `views.json` (`legacy_filters`), and the `Default` view of every db that has no views yet takes them, the one you open now and any you open later (another `db`, `ORG_ROAM_DB`, or the right path after a first run on a wrong one). Only once `views.json` holding them is written are the keys dropped from config.json.
 
 ### DB auto-detection order
 
@@ -102,7 +100,7 @@ The legacy config path `~/.config/org-roam-graph/config.json` is also read; the 
 
 ## Views and groups
 
-A **view** is a named set of filters and groups. Views are stored per org-roam db (keyed by its canonical path) in `~/.config/navi/views.json`, and navi remembers which view was last active for each db. `1` to `9` switch to a view by position, `[` and `]` step through them. Everything below can be edited in the [side panel](#side-panel); editing `views.json` by hand works too.
+A **view** is a named set of filters and groups. Views are stored per org-roam db (keyed by its canonical path) in `~/.config/navi/views.json`, and navi remembers which view was last active for each db. `1` to `9` switch to a view by position, `[` and `]` step through them. Everything below can be edited in the [side panel](#side-panel); editing `views.json` by hand works too, also while navi runs: navi picks the change up within a second, and when it saves, a setting you changed by hand is kept unless navi changed that same setting meanwhile.
 
 A **group** is a query plus how it's shown: a colour (always), and per group whether it is `visible`, whether it `pull`s its members together (a soft spring toward the group's centroid; off by default) and whether it draws a `hull` (a faint padded outline behind its nodes, labelled at their centre).
 
@@ -155,9 +153,9 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | View key | Description |
 |---|---|
 | `name` | Shown when switching (`View  Writing  (2/2)`) and in the status bar when a db has more than one view. |
-| `groups` | Manual groups, highest precedence first: `name`, `query` (see below), `colour` (`"#rrggbb"`; left out, a palette colour from the name), `visible` (default `true`), `pull`, `hull` (default `false`). A group whose query doesn't parse matches nothing and the status bar says why. |
+| `groups` | Manual groups, highest precedence first: `name`, `query` (see below), `colour` (`"#rrggbb"`; left out, a palette colour from the name), `visible` (default `true`), `pull`, `hull` (default `false`). A group whose query doesn't parse matches nothing and the status bar says why; so does a group with an empty query. |
 | `auto` | The automatic grouper: `{"kind": "none" \| "folder" \| "tag" \| "component" \| "community" \| "file"}`, plus `depth` (folder, default 1), `resolution` and `scope` (community). |
-| `auto_hidden` | Keys of hidden automatic groups, like `"tag:draft"` or `"folder:archive"`. A component or community is keyed by one of its notes (`"community:<node id>"`), so it stays hidden when the clusters are recomputed and reordered. |
+| `auto_hidden` | Keys of hidden automatic groups, like `"tag:draft"` or `"folder:archive"`. A component or community is keyed by one of its notes (`"community:<node id>"`), so it stays hidden when the clusters are recomputed and reordered, and when that note itself leaves (a daily hub under Dailies Hide, a deleted note), the cluster that is left keeps the key. |
 | `auto_pull`, `auto_hull` | Pull / hull for every automatic group. |
 | `colour_groups` | The `G` toggle. |
 | `dailies` | `"show"` or `"hide"` (`D` toggles and saves it). Read back in any case; `"shown"` / `"hidden"` work too. |
@@ -165,9 +163,9 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | `links_to_dailies_count` | When `false`, a link to a daily doesn't save a note from being an orphan: a note linked only to dailies counts as one. A daily stays connected if it links to a connected note (otherwise it's an orphan too, so `O` never leaves one drawn alone). The status bar calls these "daily-only". Only matters while dailies are shown; default `true`. |
 | `group_pull` | Strength of `pull` (default `0.1`, a slow drift; `0.5` makes tight clusters; at most `1.0`). |
 
-Next to a db's `views`, navi writes `auto_colours`: the palette slot every automatic group got, shared by all of that db's views, so colours survive restarts.
+Next to a db's `views`, navi writes `auto_colours`: the palette slot every automatic group got, shared by all of that db's views, so colours survive restarts. It also writes `notes_root`, the notes root it last saw: the root never moves deeper than that while every note is still under it, so when a top-level folder empties (or the last note directly in the root goes), folder groups keep their keys and `dir:` keeps its meaning.
 
-Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Keys navi doesn't know (your own notes, or settings from a newer navi) are kept and written back as they were; a file from a newer navi is also copied to `views.json.bad` first. Writes are atomic, and happen shortly after the last change (and on exit), so typing in the panel doesn't write once per key. `panel_open` (written by navi) remembers whether the side panel is open in that view.
+Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Keys navi doesn't know (your own notes, or settings from a newer navi) are kept and written back as they are in the file; a file from a newer navi is also copied to `views.json.bad` first. Writes are atomic, and happen shortly after the last change (and on exit), so typing in the panel doesn't write once per key. `panel_open` (written by navi) remembers whether the side panel is open in that view.
 
 ### Side panel
 
@@ -199,7 +197,7 @@ The search box (`/`) and group queries share one language. Terms next to each ot
 | `file:TEXT` | File name contains `TEXT` |
 | `level:0`, `level:>0` | File nodes / heading nodes (`=N`, `>N`, `<N`, `>=N`, `<=N`) |
 | `degree:>N` | More than N links (`=N`, `<N`, ...; counts every real link in the db) |
-| `prop:KEY`, `prop:KEY=VALUE` | Has an org property (any case; `prop:"KEY=two words"`) |
+| `prop:KEY`, `prop:KEY=VALUE` | Has an org property (any case; `prop:KEY="two words"`; `prop:"KEY=two words"` works too) |
 | `is:daily` | A daily note |
 | `is:orphan` | No link to anything in the current view (for groups: before group hiding) |
 | `is:dangling` | Has a link to a missing node or an unresolved `[[title]]` |
@@ -207,7 +205,7 @@ The search box (`/`) and group queries share one language. Terms next to each ot
 | `A OR B`, `A AND B`, `NOT A`, `-A` | Either, both, neither. `AND` binds tighter than `OR`; `-` works on a term or a group: `-(tag:a OR tag:b)` |
 | `( ... )` | Grouping |
 
-Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text stays plain text: a word whose part before `:` isn't one of the keys above (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone `-` (`Rust - Ownership`). A value starting with `/` is a regex only when the closing `/` ends it, so `path:/n/posts` is a path and `title:/^draft/` a regex. While the search doesn't parse (`(draft`), it matches as plain text, the old way, and the status bar says why and where (`col 1: missing ')' for this '('`); a group query that doesn't parse matches nothing and shows the error. "Add group" turns the search into a group query that matches the same notes (quoted, when the search only matched as plain text). `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
+Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text stays plain text: a word whose part before `:` isn't one of the keys above (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone `-` (`Rust - Ownership`). A value starting with `/` is a regex only when the closing `/` ends it, so `path:/n/posts` is a path and `title:/^draft/` a regex; a trailing `i` (`title:/^draft/i`) is accepted, as matching ignores case anyway. A closing quote ends its term: `title:"a"b` is an error, not two terms. While the search doesn't parse (`(draft`), it matches as plain text, the old way, and the status bar says why and where (`col 1: missing ')' for this '('`); a group query that doesn't parse matches nothing and shows the error. "Add group" turns the search into a group query that matches the same notes (quoted, when the search only matched as plain text). `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
 
 ---
 

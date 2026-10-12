@@ -30,17 +30,20 @@
 //! group it overlaps most (greedy max-Jaccard against the last partition),
 //! else a remembered key naming a member, else its hub. So a hidden cluster
 //! stays hidden, and a cluster keeps its colour, when sizes reorder, when
-//! another view was shown in between, and when navi restarts.
+//! another view was shown in between, and when navi restarts. When the
+//! member a key names leaves every cluster (a daily hub under Dailies Hide,
+//! a deleted note), the cluster that overlaps its old one most keeps the key
+//! anyway, and with it its colour and its hiding.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
 use crate::community;
 use crate::graph::Graph;
 use crate::query::{EvalCtx, Query, QueryError};
-use crate::view::{compute_view, compute_view_hiding, dir_components, notes_root_depth, OrphansMode, ViewFilter, ViewState};
+use crate::view::{compute_view, compute_view_hiding, dir_components, OrphansMode, ViewFilter, ViewState};
 
 pub type GroupId = usize; // index into GroupResolution::groups
 
@@ -466,7 +469,7 @@ fn hub(g: &Graph, members: &[usize]) -> Option<usize> {
 /// root. Files directly in the root stay ungrouped.
 fn auto_folder(g: &Graph, eligible: &[bool], depth: usize) -> AutoSet {
     let n = g.node_list.len();
-    let root = notes_root_depth(g.node_list.iter().map(|nd| nd.file.as_str()));
+    let root = g.notes_root_depth();
     let mut set = AutoSet::with_nodes(n);
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut keys: Vec<(String, String)> = Vec::new();
@@ -606,21 +609,26 @@ enum Communities {
 }
 
 /// Latest-wins community computation. Graphs under `sync_below` nodes are
-/// computed inline (a few ms); bigger ones run on a worker thread, at most
-/// one at a time, and a request made while one runs replaces any earlier
-/// queued request (the debounce); asking again for the running one drops
-/// the queue. Until the new partition lands, the last one keeps showing,
-/// matched to the current nodes by id (a reload that adds a note doesn't
-/// blank or recolour anything).
+/// computed inline (well under a ms, so a resolution drag stays smooth);
+/// bigger ones run on a worker thread, at most one at a time, and a request
+/// made while one runs replaces any earlier queued request (the debounce);
+/// asking again for the running one drops the queue, and so does a grouping
+/// that no longer asks for communities (`drop_queued`). Until the new
+/// partition lands, the last one keeps showing, matched to the current
+/// nodes by id (a reload that adds a note doesn't blank or recolour
+/// anything). The last few partitions are kept, so going back to a
+/// resolution is instant.
 pub struct CommunityCache {
     pub sync_below: usize,
-    done:           Option<(u64, Partition, NodeIds)>,
+    done:           VecDeque<(u64, Partition, NodeIds)>, // newest first, at most DONE_KEEP
     running:        Option<(u64, NodeIds, Landing)>,
     queued:         Option<CommunityJob>,
 }
 
+const DONE_KEEP: usize = 4;
+
 impl Default for CommunityCache {
-    fn default() -> Self { CommunityCache { sync_below: 3000, done: None, running: None, queued: None } }
+    fn default() -> Self { CommunityCache { sync_below: 500, done: VecDeque::new(), running: None, queued: None } }
 }
 
 impl CommunityCache {
@@ -631,11 +639,22 @@ impl CommunityCache {
         self.running = Some((key, ids, rx));
     }
 
+    fn keep(&mut self, key: u64, p: Partition, ids: NodeIds) {
+        self.done.retain(|(k, ..)| *k != key);
+        self.done.push_front((key, p, ids));
+        self.done.truncate(DONE_KEEP);
+    }
+
     fn get(&mut self, job: CommunityJob) -> Communities {
-        if let Some((k, p, _)) = &self.done { if *k == job.key { return Communities::Fresh(p.clone()); } }
+        if let Some(at) = self.done.iter().position(|(k, ..)| *k == job.key) {
+            let hit = self.done.remove(at).expect("found");
+            let p = hit.1.clone();
+            self.done.push_front(hit); // the newest is what shows while another runs
+            return Communities::Fresh(p);
+        }
         if job.n < self.sync_below {
             let p = Arc::new(job.run());
-            self.done = Some((job.key, p.clone(), job.ids));
+            self.keep(job.key, p.clone(), job.ids);
             return Communities::Fresh(p);
         }
         let ids = job.ids.clone();
@@ -644,11 +663,15 @@ impl CommunityCache {
             Some(_) => self.queued = Some(job),
             None    => self.spawn(job),
         }
-        match &self.done {
+        match self.done.front() {
             Some((_, p, from)) => Communities::Stale(remap_partition(p, from, &ids)),
             None => Communities::Pending,
         }
     }
+
+    /// Nothing asks for communities any more (another grouper, another
+    /// view): a queued request is dropped, never run.
+    pub fn drop_queued(&mut self) { self.queued = None; }
 
     /// Collect a finished job (and start the queued one). True when a new
     /// partition landed: recompute the view.
@@ -656,7 +679,8 @@ impl CommunityCache {
         let Some((key, ids, rx)) = &self.running else { return false };
         match rx.try_recv() {
             Ok(p) => {
-                self.done    = Some((*key, Arc::new(p), ids.clone()));
+                let (key, ids) = (*key, ids.clone());
+                self.keep(key, Arc::new(p), ids);
                 self.running = None;
                 if let Some(job) = self.queued.take() { self.spawn(job); }
                 true
@@ -708,15 +732,20 @@ fn first_in(set: &HashSet<String>, index: &HashMap<&str, &String>) -> Option<Str
 /// between); else the key of the old group it inherited from, while that
 /// member is still in it; else a remembered key (`known`, with a colour)
 /// naming a member, so a restart finds the same key; else its hub's
-/// (`fallback`). Every key names a member and classes are disjoint, so keys
-/// are unique.
+/// (`fallback`). Last, a group whose inherited key names a member that left
+/// EVERY group (filtered out, deleted, now an orphan) keeps that key over a
+/// remembered or hub one: its colour and its hiding go with the members
+/// that stayed. Classes are disjoint and every other key names a member, so
+/// keys are unique.
 fn partition_keys<'k>(kind: &str, sets: &[HashSet<String>], inherited: &[Option<&String>],
                       hidden: impl Iterator<Item = &'k String>, known: impl Iterator<Item = &'k String>, fallback: &[String]) -> Vec<String> {
     let hidden = by_anchor(kind, hidden);
     let known  = by_anchor(kind, known);
+    let gone   = |key: &str| anchor(kind, key).is_some_and(|a| !sets.iter().any(|s| s.contains(a)));
     sets.iter().enumerate().map(|(k, set)| {
         first_in(set, &hidden)
             .or_else(|| inherited[k].filter(|key| anchor(kind, key).is_some_and(|a| set.contains(a))).cloned())
+            .or_else(|| inherited[k].filter(|key| gone(key)).cloned())
             .or_else(|| first_in(set, &known))
             .unwrap_or_else(|| fallback[k].clone())
     }).collect()
@@ -763,7 +792,9 @@ impl Grouping {
                 visible: grp.visible, pull: grp.pull, hull: grp.hull, members: 0, shown: 0,
                 error: q.as_ref().err().cloned(),
             });
-            if let Ok(q) = q {
+            // an empty query matches nothing here (the search box's matches
+            // everything): a new or cleared group never takes the whole graph
+            if let Some(q) = q.as_ref().ok().filter(|q| !q.is_empty()) {
                 for i in (0..n).filter(|&i| eligible[i]) { if q.matches(&cx, i) { members[i].push(gi); } }
             }
         }
@@ -792,6 +823,7 @@ impl Grouping {
                 }
             }
         };
+        if !matches!(spec.auto, AutoGrouper::Community { .. }) { self.community.drop_queued(); }
         let slots: Vec<u8> = match spec.auto {
             AutoGrouper::Component | AutoGrouper::Community { .. } => {
                 // colours AND keys (so hiding) follow the members, not the size rank
@@ -852,6 +884,22 @@ impl GroupResolution {
             info.colour = manual_colour(g);
         }
         true
+    }
+
+    /// The hidden keys keeping auto group `key` hidden: itself and, for a
+    /// component or community, every hidden key naming one of its members
+    /// (a cluster merged from two hidden ones answers to either). Unhiding
+    /// drops them all, so one click shows it.
+    pub fn hiding_keys(&self, g: &Graph, key: &str, hidden: &[String]) -> Vec<String> {
+        let kind  = key_kind(key);
+        let named = matches!(kind, "component" | "community");
+        let gid   = self.groups.iter().position(|x| !x.manual && x.key == key);
+        let ids: HashSet<&str> = match gid.filter(|_| named) {
+            Some(gid) => self.members.iter().enumerate().filter(|(_, m)| m.contains(&gid))
+                .filter_map(|(i, _)| g.node_list.get(i)).map(|nd| nd.id.as_str()).collect(),
+            None => HashSet::new(),
+        };
+        hidden.iter().filter(|k| *k == key || anchor(kind, k).is_some_and(|a| ids.contains(a))).cloned().collect()
     }
 }
 
@@ -1645,5 +1693,159 @@ mod tests {
         let mut k = AutoGrouper::None;
         for _ in 0..6 { k = k.cycled(); }
         assert_eq!(k, AutoGrouper::None, "Shift+G cycles through all six");
+    }
+
+    // ── Review round 3 ────────────────────────────────────────────────────────
+
+    /// Two daily hubs (d1 + p1..p5, d2 + q1..q4): Dailies Hide leaves {p1 p2}
+    /// and {q1 q2 q3}, now ranked the other way round. Each keeps its key and
+    /// so its colour (Jaccard pairs them), instead of the lowest free slots
+    /// in the new size order swapping them.
+    #[test]
+    fn partition_colours_survive_their_hub_leaving() {
+        let mut nodes = vec![node("d1", "2026-01-01", "/n/daily/d1.org", &[]), node("d2", "2026-01-02", "/n/daily/d2.org", &[])];
+        let mut edges = vec![e("p1", "p2"), e("q1", "q2"), e("q2", "q3")];
+        for k in 1..=5 { nodes.push(node(&format!("p{k}"), &format!("P{k}"), &format!("/n/p{k}.org"), &[])); edges.push(e("d1", &format!("p{k}"))); }
+        for k in 1..=4 { nodes.push(node(&format!("q{k}"), &format!("Q{k}"), &format!("/n/q{k}.org"), &[])); edges.push(e("d2", &format!("q{k}"))); }
+        let g = Graph::new(nodes, edges);
+        let shown = ViewFilter { dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        for auto in [AutoGrouper::Component, AutoGrouper::Community { resolution: 1.0, scope: CommunityScope::Visible }] {
+            let spec = GroupSpec::new(vec![], auto);
+            let mut grouping = Grouping::default();
+            let (_, r1) = grouping.compute(&g, &shown, &spec);
+            let (_, r2) = grouping.compute(&g, &ViewFilter { dailies: DailiesMode::Hide, ..shown.clone() }, &spec);
+            for s in ["p1", "q1"] {
+                assert!(colour_of(&g, &r2, s).is_some(), "{auto:?}: {s} grouped");
+                assert_eq!(colour_of(&g, &r1, s), colour_of(&g, &r2, s), "{auto:?}: {s} keeps its colour");
+            }
+            assert_ne!(colour_of(&g, &r2, "p1"), colour_of(&g, &r2, "q1"));
+        }
+    }
+
+    /// A hidden component whose key names its hub stays hidden when the hub
+    /// leaves: a daily under Dailies Hide (D), or a note deleted (W). The
+    /// other cluster is untouched.
+    #[test]
+    fn a_hidden_component_stays_hidden_when_its_hub_leaves() {
+        let nodes = || vec![
+            node("a", "A", "/n/a.org", &[]), node("b", "B", "/n/b.org", &[]), node("c", "C", "/n/c.org", &[]),
+            node("x", "X", "/n/x.org", &[]), node("y", "Y", "/n/y.org", &[]), node("z", "Z", "/n/z.org", &[]),
+        ];
+        let mut with_d = nodes();
+        with_d.push(node("d", "2026-01-01", "/n/daily/d.org", &[]));
+        let g = Graph::new(with_d, vec![e("a", "d"), e("b", "d"), e("c", "d"), e("a", "b"), e("x", "y"), e("y", "z")]);
+        let shown = ViewFilter { dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        let mut spec = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut grouping = Grouping::default();
+        let (_, r) = grouping.compute(&g, &shown, &spec);
+        let key = r.groups[r.members[id(&g, "a")][0]].key.clone();
+        assert_eq!(key, "component:d", "the daily is the hub");
+        spec.auto_hidden.insert(key.clone());
+        let (v, _) = grouping.compute(&g, &shown, &spec);
+        assert!(!v.visible[id(&g, "a")] && v.visible[id(&g, "x")]);
+        // D: the hub is filtered out
+        let (v, r) = grouping.compute(&g, &ViewFilter { dailies: DailiesMode::Hide, ..shown.clone() }, &spec);
+        assert!(!v.visible[id(&g, "a")] && !v.visible[id(&g, "b")], "a b stay hidden: {:?}", r.groups.iter().map(|g| &g.key).collect::<Vec<_>>());
+        assert!(v.visible[id(&g, "x")], "x y z stay shown");
+        // D again: the hub is back, still hidden
+        let (v, _) = grouping.compute(&g, &shown, &spec);
+        assert!(!v.visible[id(&g, "a")] && !v.visible[id(&g, "d")]);
+        // W after the hub note was deleted
+        let g2 = Graph::new(nodes(), vec![e("a", "b"), e("b", "c"), e("x", "y"), e("y", "z")]);
+        let (v, _) = grouping.compute(&g2, &shown, &spec);
+        assert!(!v.visible[id(&g2, "a")] && !v.visible[id(&g2, "c")], "the reloaded cluster stays hidden");
+        assert!(v.visible[id(&g2, "x")]);
+    }
+
+    /// Two hidden components merge (a new link): the merged one answers to
+    /// both keys, and unhiding it drops both, so one click shows it.
+    #[test]
+    fn unhiding_a_merged_cluster_takes_one_click() {
+        let mut spec = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut grouping = Grouping::default();
+        let g1 = chains(3, 2);
+        let (_, r) = grouping.compute(&g1, &ViewFilter::default(), &spec);
+        for gi in &r.groups { spec.auto_hidden.insert(gi.key.clone()); }
+        assert_eq!(spec.auto_hidden.len(), 2);
+        let mut nodes: Vec<RawNode> = g1.node_list.iter().map(|n| node(&n.id, &n.title, &n.file, &[])).collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let g2 = Graph::new(nodes, vec![e("a0", "a1"), e("a1", "a2"), e("b0", "b1"), e("a2", "b0")]);
+        let (v, r) = grouping.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!(r.groups.len(), 1);
+        assert!(!v.visible[id(&g2, "a0")]);
+        let hidden: Vec<String> = spec.auto_hidden.iter().cloned().collect();
+        let drop = r.hiding_keys(&g2, &r.groups[0].key, &hidden);
+        assert_eq!(drop.len(), 2, "both keys hide it: {drop:?}");
+        spec.auto_hidden.retain(|k| !drop.contains(k));
+        let (v, _) = grouping.compute(&g2, &ViewFilter::default(), &spec);
+        assert!(v.visible[id(&g2, "a0")] && v.visible[id(&g2, "b1")], "one click shows it");
+        // a tag key never matches a node id
+        let tags = GroupResolution::default();
+        assert_eq!(tags.hiding_keys(&g2, "tag:a0", &["tag:a0".into(), "tag:b0".into()]), vec!["tag:a0".to_string()]);
+    }
+
+    /// An empty (or blank) group query matches nothing: a group added with
+    /// no search, or one whose query is being retyped, never takes, colours
+    /// or hides the whole graph.
+    #[test]
+    fn an_empty_group_query_matches_nothing() {
+        let g = fixture();
+        for q in ["", "   "] {
+            let mut empty = Group::new("Group 1", q);
+            empty.visible = false;
+            let spec = GroupSpec::new(vec![empty], AutoGrouper::Folder { depth: 1 });
+            let (v, r) = run(&g, &spec, &ViewFilter::default());
+            assert_eq!((r.groups[0].members, r.groups[0].error.is_none()), (0, true), "{q:?}");
+            assert!(v.visible.iter().all(|&x| x), "{q:?}: nothing hidden");
+            assert!(r.primary[id(&g, "a")].is_some_and(|p| !r.groups[p].manual), "the folder colour stays");
+        }
+    }
+
+    /// Leaving the community grouper drops a queued request (it never runs),
+    /// and a partition computed before is still there on the way back.
+    #[test]
+    fn leaving_communities_drops_the_queue_and_keeps_the_cache() {
+        let g = cliques(&[6, 5, 4]);
+        let at = |r: f64| GroupSpec::new(vec![], AutoGrouper::Community { resolution: r, scope: CommunityScope::All });
+        let mut grouping = Grouping::default();
+        grouping.community.sync_below = 0;
+        grouping.compute(&g, &ViewFilter::default(), &at(1.0)); // runs
+        land(&mut grouping);
+        grouping.compute(&g, &ViewFilter::default(), &at(3.0)); // runs
+        grouping.compute(&g, &ViewFilter::default(), &at(2.0)); // queued
+        grouping.compute(&g, &ViewFilter::default(), &GroupSpec::new(vec![], AutoGrouper::Tag));
+        land(&mut grouping);
+        assert!(!grouping.community.pending(), "the queued 2.0 never ran");
+        let (_, r) = grouping.compute(&g, &ViewFilter::default(), &at(1.0));
+        assert!(!grouping.community.pending() && !r.groups.is_empty(), "1.0 is still cached");
+        grouping.compute(&g, &ViewFilter::default(), &at(3.0));
+        assert!(!grouping.community.pending(), "and so is 3.0");
+        // a graph a slider drag recomputes per frame stays on the worker
+        // above a few hundred nodes (inline it would cost frames)
+        assert!(CommunityCache::default().sync_below <= 500);
+    }
+
+    /// The notes root is pinned: the last top-level note gone, folder groups
+    /// keep their keys (and hiding) and a relative `dir:` its folder.
+    #[test]
+    fn a_pinned_notes_root_keeps_folder_keys_and_dir_queries() {
+        let files = [("w1", "/r/work/a/w1.org"), ("w2", "/r/work/b/w2.org"), ("h", "/r/home/h.org")];
+        let mut spec = GroupSpec::new(vec![Group::new("W", "dir:work")], AutoGrouper::Folder { depth: 1 });
+        spec.auto_hidden.insert("folder:work".into());
+        let keys = |r: &GroupResolution| r.groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
+        let g1 = Graph::new(files.iter().map(|(i, f)| node(i, i, f, &[])).collect(), vec![]);
+        assert_eq!(g1.notes_root_path().as_deref(), Some("/r"));
+        let (_, r1) = run(&g1, &spec, &ViewFilter::default());
+        assert_eq!(keys(&r1), vec!["manual:W", "folder:home", "folder:work"]);
+        let mut g2 = Graph::new(files[..2].iter().map(|(i, f)| node(i, i, f, &[])).collect(), vec![]);
+        g2.root_pin = g1.notes_root_path();
+        let (v2, r2) = run(&g2, &spec, &ViewFilter::default());
+        assert_eq!(keys(&r2), vec!["manual:W", "folder:work"]);
+        assert!(!r2.groups[1].visible, "folder:work is still the hidden one");
+        assert_eq!(r2.groups[0].members, 2, "dir:work still matches");
+        assert!(v2.visible.iter().all(|&x| x), "W is visible, so its members show (Foam)");
+        // without the pin the root moved to /r/work
+        let (_, r3) = run(&Graph::new(files[..2].iter().map(|(i, f)| node(i, i, f, &[])).collect(), vec![]), &spec, &ViewFilter::default());
+        assert_eq!(keys(&r3), vec!["manual:W", "folder:a", "folder:b"]);
     }
 }

@@ -21,22 +21,32 @@
 //! `views.json.bad` before navi ever writes over it. A views.json that
 //! exists but can't be read at all (permissions, an I/O error) is never
 //! written over in that session. Saves are atomic (temp file + rename) and
-//! re-read the file first: every db but this session's own keeps what is on
-//! disk, so two navi windows on different dbs don't undo each other.
+//! re-read the file first (`sync`): every db but this session's own keeps
+//! what is on disk, so two navi windows on different dbs don't undo each
+//! other; in this session's own db, whatever changed in the file since navi
+//! last read or wrote it (a hand edit while navi runs) is taken, setting by
+//! setting, unless this session changed that same setting too. Unknown
+//! top-level keys are always the file's.
 //!
 //! Auto-group colours (`auto_colours`, a palette slot per key) belong to the
 //! db, not a view, so a tag has one colour in every view; per-view maps an
 //! earlier build wrote are merged into the db's on load (the active view's
 //! first).
 //!
-//! Migration: the first time a db has no views, its "Default" view takes the
-//! `dailies` / `orphans` / `links_to_dailies_count` an older config.json
-//! carried; main.rs drops those keys from config.json only once views.json
-//! holding them has been written.
+//! Migration: the `dailies` / `orphans` / `links_to_dailies_count` an older
+//! config.json carried move to views.json's top level (`legacy_filters`):
+//! every db seen for the first time, then or later, seeds its "Default"
+//! view from them. main.rs drops those keys from config.json only once
+//! views.json holding them has been written.
+//!
+//! `notes_root` (per db) is the notes root last seen, so a folder that
+//! empties never moves the root deeper (see `view::pinned_root_depth`).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::config::{atomic_write, parse_tolerant, Config, LegacyView};
 use crate::groups::{AutoGrouper, Group, GroupSpec};
@@ -166,6 +176,8 @@ pub struct DbViews {
     pub views:        Vec<View>,
     #[serde(default, alias = "auto_colors", skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_colours: BTreeMap<String, u8>,                // palette slot per auto-group key, every view's
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_root:   Option<String>,                      // the notes root last seen ("/Users/me/notes")
     #[serde(flatten)]
     pub extra:        BTreeMap<String, serde_json::Value>, // keys this navi doesn't know: kept as they are
 }
@@ -176,8 +188,10 @@ impl DbViews {
 
 #[derive(Serialize)]
 struct FileOut<'a> {
-    version: u64,
-    dbs:     &'a BTreeMap<String, DbViews>,
+    version:        u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_filters: Option<&'a LegacyView>,
+    dbs:            &'a BTreeMap<String, DbViews>,
     #[serde(flatten)]
     extra:   &'a serde_json::Map<String, serde_json::Value>,
 }
@@ -187,6 +201,7 @@ struct FileOut<'a> {
 pub struct Parsed {
     pub dbs:     BTreeMap<String, DbViews>,
     pub extra:   serde_json::Map<String, serde_json::Value>, // top-level keys this navi doesn't know
+    pub legacy:  Option<LegacyView>,                         // `legacy_filters`: the first-view seed
     pub dropped: bool,                                       // something was dropped: back the original up
 }
 
@@ -195,9 +210,14 @@ pub struct ViewStore {
     pub path:   PathBuf,
     pub dbs:    BTreeMap<String, DbViews>,
     extra:      serde_json::Map<String, serde_json::Value>, // unknown top-level keys, written back
-    owned:      BTreeSet<String>, // dbs this session edits; save() takes every other one from disk
-    read_error: Option<String>,   // views.json exists but couldn't be read: never written over
+    legacy:     Option<LegacyView>,               // an older config.json's filters: every new db's first view
+    owned:      BTreeSet<String>,                 // dbs this session edits; sync() takes every other one from disk
+    base:       BTreeMap<String, DbViews>,        // the file's dbs as last read or written (what a hand edit changed)
+    seen:       Option<SystemTime>,               // the file's mtime then
+    read_error: Option<String>,                   // views.json exists but couldn't be read: never written over
 }
+
+fn mtime(path: &Path) -> Option<SystemTime> { std::fs::metadata(path).and_then(|m| m.modified()).ok() }
 
 /// The key a db's views are stored under: its canonical path (symlinks and
 /// `..` resolved). A db that doesn't exist yet resolves its deepest existing
@@ -233,12 +253,14 @@ impl ViewStore {
     pub fn load(path: &Path) -> Self {
         let mut store = ViewStore { path: path.to_path_buf(), ..ViewStore::default() };
         match Self::read(path) {
-            Ok(p) => if let Some(p) = p { store.dbs = p.dbs; store.extra = p.extra; },
+            Ok(p) => if let Some(p) = p { store.dbs = p.dbs; store.extra = p.extra; store.legacy = p.legacy; },
             Err(e)  => {
                 eprintln!("navi: couldn't read {}: {e}; views won't be saved this session", path.display());
                 store.read_error = Some(e.to_string());
             }
         }
+        store.base = store.dbs.clone();
+        store.seen = mtime(path);
         store
     }
 
@@ -291,13 +313,20 @@ impl ViewStore {
             }
             _ => {}
         }
+        let legacy = match root.remove("legacy_filters") {
+            None => None,
+            Some(v) => match serde_json::from_value::<LegacyView>(v) {
+                Ok(l)  => Some(l).filter(|l| *l != LegacyView::default()),
+                Err(_) => { eprintln!("navi: views.json: bad \"legacy_filters\", ignored"); dropped = true; None }
+            },
+        };
         let dbs = match root.remove("dbs") {
             Some(serde_json::Value::Object(d)) => d,
             Some(_) => {
                 eprintln!("navi: views.json: \"dbs\" is not an object");
-                return Parsed { dropped: true, extra: root, ..Parsed::default() };
+                return Parsed { dropped: true, extra: root, legacy, ..Parsed::default() };
             }
-            None => return Parsed { dropped, extra: root, ..Parsed::default() },
+            None => return Parsed { dropped, extra: root, legacy, ..Parsed::default() },
         };
         for (key, entry) in dbs {
             let serde_json::Value::Object(mut entry) = entry else {
@@ -344,29 +373,62 @@ impl ViewStore {
                     for (k, s) in std::mem::take(&mut v.auto_colours) { auto_colours.entry(k).or_insert(s); }
                 }
             }
-            out.insert(key, DbViews { active, views, auto_colours, extra: entry.into_iter().collect() });
+            let notes_root = match entry.remove("notes_root") {
+                None => None,
+                Some(serde_json::Value::String(s)) => Some(s),
+                Some(_) => { eprintln!("navi: views.json: {key}: bad \"notes_root\", ignored"); dropped = true; None }
+            };
+            out.insert(key, DbViews { active, views, auto_colours, notes_root, extra: entry.into_iter().collect() });
         }
-        Parsed { dbs: out, extra: root, dropped }
+        Parsed { dbs: out, extra: root, legacy, dropped }
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(&FileOut { version: VERSION, dbs: &self.dbs, extra: &self.extra }).unwrap_or_else(|_| "{}".into())
+        let out = FileOut { version: VERSION, legacy_filters: self.legacy.as_ref(), dbs: &self.dbs, extra: &self.extra };
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
     }
 
-    /// Write views.json. Every db this session doesn't edit is first taken
-    /// from the file as it is now (another navi may have saved it since we
-    /// loaded); refused when the file couldn't be read at load.
-    pub fn save(&mut self) -> std::io::Result<()> {
+    /// The file changed since this session last read or wrote it.
+    pub fn changed_on_disk(&self) -> bool { self.read_error.is_none() && mtime(&self.path) != self.seen }
+
+    /// Take what changed in views.json since this session last read or wrote
+    /// it (a hand edit, another navi). Every db this session doesn't edit is
+    /// the file's; in one it does, a setting changed in the file and not
+    /// here is taken from the file, one changed in both keeps this session's
+    /// (`merge_db`). A file that lost content to an error (a typo) changes
+    /// nothing here: it is backed up, and the next save writes this
+    /// session's. Unknown top-level keys are the file's. True when a db this
+    /// session edits changed: reload the working view.
+    pub fn sync(&mut self) -> std::io::Result<bool> {
+        if self.read_error.is_some() { return Ok(false); }
+        let seen = mtime(&self.path);
+        let Some(disk) = Self::read(&self.path)? else { self.seen = seen; return Ok(false) };
+        self.seen = seen;
+        let mut changed = false;
+        for (k, d) in disk.dbs {
+            if !self.owned.contains(&k) { self.base.insert(k.clone(), d.clone()); self.dbs.insert(k, d); continue; }
+            if disk.dropped || self.base.get(&k) == Some(&d) { continue; }
+            let ours = self.dbs.entry(k.clone()).or_default();
+            changed |= merge_db(self.base.get(&k), ours, &d);
+            self.base.insert(k, d);
+        }
+        self.extra = disk.extra;
+        if self.legacy.is_none() { self.legacy = disk.legacy; }
+        Ok(changed)
+    }
+
+    /// Write views.json, after taking what changed in it (`sync`); refused
+    /// when the file couldn't be read at load. True when the sync changed a
+    /// db this session edits (reload the working view).
+    pub fn save(&mut self) -> std::io::Result<bool> {
         if let Some(e) = &self.read_error {
             return Err(std::io::Error::other(format!("not written: it couldn't be read when navi started ({e})")));
         }
-        if let Some(disk) = Self::read(&self.path)? {
-            for (k, v) in disk.dbs {
-                if !self.owned.contains(&k) { self.dbs.insert(k, v); }
-            }
-            for (k, v) in disk.extra { self.extra.entry(k).or_insert(v); }
-        }
-        atomic_write(&self.path, &self.to_json())
+        let changed = self.sync()?;
+        atomic_write(&self.path, &self.to_json())?;
+        self.base = self.dbs.clone();
+        self.seen = mtime(&self.path);
+        Ok(changed)
     }
 
     /// False when views.json couldn't be read at load: every save fails, so
@@ -387,16 +449,35 @@ impl ViewStore {
         true
     }
 
-    /// Make sure `key` has at least one view. A db seen for the first time
-    /// gets "Default", seeded from `legacy` (an older config.json's filters).
-    /// True when it created one (save, then drop the legacy keys).
+    /// Make sure `key` has at least one view. `legacy` (an older
+    /// config.json's filters) becomes the store's `legacy_filters`; a db seen
+    /// for the first time, now or in any later session, gets "Default"
+    /// seeded from them. True when it created one (save, then drop the
+    /// legacy keys from config.json).
     pub fn ensure_db(&mut self, key: &str, legacy: Option<&LegacyView>) -> bool {
+        if let Some(l) = legacy { self.legacy = Some(*l); }
+        let seed = self.legacy;
         self.owned.insert(key.to_string());
         let db = self.dbs.entry(key.to_string()).or_default();
         if !db.views.is_empty() { return false; }
-        let v = match legacy { Some(l) => View::from_legacy("Default", l), None => View::named("Default") };
+        let v = match seed { Some(l) => View::from_legacy("Default", &l), None => View::named("Default") };
         db.active = v.name.clone();
         db.views.push(v);
+        true
+    }
+
+    /// The legacy filters every new db's first view starts from.
+    pub fn legacy(&self) -> Option<LegacyView> { self.legacy }
+
+    /// The notes root last seen for the db (`Graph::root_pin`).
+    pub fn notes_root(&self, key: &str) -> Option<String> { self.dbs.get(key)?.notes_root.clone() }
+
+    /// Remember the db's notes root. True when it changed (save).
+    pub fn set_notes_root(&mut self, key: &str, root: &str) -> bool {
+        self.owned.insert(key.to_string());
+        let db = self.dbs.entry(key.to_string()).or_default();
+        if db.notes_root.as_deref() == Some(root) { return false; }
+        db.notes_root = Some(root.to_string());
         true
     }
 
@@ -478,6 +559,73 @@ impl ViewStore {
         if db.active == v.name { return false; }
         db.active = v.name.clone();
         true
+    }
+}
+
+// ── Merging an outside edit ──────────────────────────────────────────────────
+
+/// Three-way merge into `ours` of what changed from `base` to `disk`: a
+/// value changed only in the file is taken from it; one changed here (both
+/// changed, too) stays ours. Objects merge key by key (a key added in the
+/// file is added, one it removed is removed when ours is still the base's);
+/// anything else (a group list, a number) is one value. True when `ours`
+/// changed.
+fn merge_json(base: Option<&Value>, ours: &mut Value, disk: &Value) -> bool {
+    if base == Some(disk) || &*ours == disk { return false; }
+    if let (Value::Object(o), Value::Object(d)) = (&mut *ours, disk) {
+        let b = base.and_then(Value::as_object);
+        let mut changed = false;
+        for (k, dv) in d {
+            let bv = b.and_then(|b| b.get(k));
+            match o.get_mut(k) {
+                Some(ov) => changed |= merge_json(bv, ov, dv),
+                None if bv.is_none() => { o.insert(k.clone(), dv.clone()); changed = true; } // new in the file
+                None => {} // removed here: stays removed
+            }
+        }
+        for (k, bv) in b.into_iter().flatten() {
+            if !d.contains_key(k) && o.get(k) == Some(bv) { o.remove(k); changed = true; }
+        }
+        return changed;
+    }
+    if Some(&*ours) == base { *ours = disk.clone(); return true; }
+    false
+}
+
+/// `merge_json` for one db's entry, with its views matched by name: a view
+/// added in the file is added, one it deleted (or renamed) is removed when
+/// this session didn't touch it (never the last), and a view in both merges
+/// setting by setting. True when `ours` changed.
+fn merge_db(base: Option<&DbViews>, ours: &mut DbViews, disk: &DbViews) -> bool {
+    let json  = |d: &DbViews| serde_json::to_value(d).unwrap_or(Value::Null);
+    let views = |v: &mut Value| match v.as_object_mut().and_then(|m| m.remove("views")) { Some(Value::Array(a)) => a, _ => Vec::new() };
+    let name  = |v: &Value| v.get("name").and_then(Value::as_str).map(str::to_string);
+    let find  = |list: &[Value], n: &Option<String>| list.iter().position(|v| name(v) == *n);
+    let (mut o, mut d) = (json(ours), json(disk));
+    let mut b  = base.map(json);
+    let mut ov = views(&mut o);
+    let dv     = views(&mut d);
+    let bv     = b.as_mut().map(views).unwrap_or_default();
+    let mut changed = merge_json(b.as_ref(), &mut o, &d);
+    for dview in &dv {
+        let n = name(dview);
+        let bview = find(&bv, &n).map(|i| &bv[i]);
+        match find(&ov, &n) {
+            Some(i) => changed |= merge_json(bview, &mut ov[i], dview),
+            None if bview.is_none() => { ov.push(dview.clone()); changed = true; }
+            None => {} // deleted or renamed here: that wins
+        }
+    }
+    let gone: Vec<usize> = (0..ov.len()).filter(|&i| {
+        let n = name(&ov[i]);
+        find(&dv, &n).is_none() && find(&bv, &n).is_some_and(|j| bv[j] == ov[i])
+    }).collect();
+    if gone.len() < ov.len() { for &i in gone.iter().rev() { ov.remove(i); changed = true; } }
+    if !changed { return false; }
+    if let Some(m) = o.as_object_mut() { m.insert("views".into(), Value::Array(ov)); }
+    match serde_json::from_value::<DbViews>(o) {
+        Ok(db) => { *ours = db; true }
+        Err(e) => { eprintln!("navi: views.json: couldn't merge an outside edit ({e}); keeping this session's"); false }
     }
 }
 
@@ -802,6 +950,115 @@ mod tests {
         let back = ViewStore::load(&path);
         assert_eq!(back.views("/db1").iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), vec!["Default", "A-new"]);
         assert_eq!(back.views("/db2")[0].group_pull, 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy filters stay in views.json: a db opened for the first time
+    /// in a later session (another "db", or the right path after a first run
+    /// on a stale one) starts from them too.
+    #[test]
+    fn legacy_filters_seed_every_new_db() {
+        let dir  = tmp("legacy-seed");
+        let cfgp = dir.join("config.json");
+        let path = dir.join("views.json");
+        std::fs::write(&cfgp, r#"{ "db": "/stale/org-roam.db", "dailies": "hide", "orphans": "hide" }"#).unwrap();
+        let mut cfg = Config::load_from(&cfgp);
+        let mut s = ViewStore::load(&path);
+        assert!(s.ensure_db("/stale/org-roam.db", cfg.legacy_view().as_ref()));
+        s.save().unwrap();
+        cfg.clear_legacy_view();
+        cfg.save_to(&cfgp).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("legacy_filters"));
+
+        let cfg = Config::load_from(&cfgp);
+        assert_eq!(cfg.legacy_view(), None, "gone from config.json");
+        let mut s = ViewStore::load(&path);
+        assert!(s.ensure_db("/real/org-roam.db", cfg.legacy_view().as_ref()));
+        let v = s.active("/real/org-roam.db");
+        assert_eq!((v.dailies, v.orphans), (DailiesMode::Hide, OrphansMode::Hide), "seeded from views.json");
+        s.save().unwrap();
+        assert_eq!(ViewStore::load(&path).legacy(), Some(LegacyView { dailies: Some(DailiesMode::Hide), orphans: Some(OrphansMode::Hide), links_to_dailies_count: None }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown top-level keys are the file's as it is now: a newer value (or
+    /// a removal) made while navi runs is never written back over.
+    #[test]
+    fn unknown_top_level_keys_follow_the_file() {
+        let dir  = tmp("extra");
+        let path = dir.join("views.json");
+        std::fs::write(&path, r#"{ "version": 1, "dbs": {}, "future": 1, "gone": true }"#).unwrap();
+        let mut s = ViewStore::load(&path);
+        std::fs::write(&path, r#"{ "version": 1, "dbs": {}, "future": 2 }"#).unwrap();
+        s.ensure_db("/a.db", None);
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"future\": 2") && !text.contains("gone"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand edit of this session's own db while navi runs: a setting
+    /// changed only in the file is kept, one changed here too stays this
+    /// session's; views added or deleted in the file follow it.
+    #[test]
+    fn a_hand_edit_while_navi_runs_is_kept() {
+        let dir  = tmp("handedit");
+        let path = dir.join("views.json");
+        let mut s = ViewStore::load(&path);
+        s.ensure_db("/a.db", None);
+        s.add_view("/a.db", View::named("Old"));
+        s.set_active("/a.db", 0);
+        assert!(!s.save().unwrap(), "nothing from outside");
+        assert!(!s.changed_on_disk());
+
+        // in Emacs: a group, a pull strength, a new view; "Old" deleted
+        let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let db = &mut file["dbs"]["/a.db"];
+        db["views"][0]["groups"] = serde_json::json!([{ "name": "Hand", "query": "tag:x" }]);
+        db["views"][0]["group_pull"] = serde_json::json!(0.4);
+        db["views"][0]["orphans"] = serde_json::json!("only");
+        db["views"].as_array_mut().unwrap().remove(1);
+        db["views"].as_array_mut().unwrap().push(serde_json::json!({ "name": "Typed" }));
+        std::thread::sleep(std::time::Duration::from_millis(20)); // a new mtime
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        assert!(s.changed_on_disk());
+
+        // meanwhile in navi: D, and the same orphans setting
+        s.active_mut("/a.db").dailies = DailiesMode::Hide;
+        s.active_mut("/a.db").orphans = OrphansMode::Hide;
+        assert!(s.save().unwrap(), "the outside edit was taken: reload the working view");
+        for back in [s.active("/a.db"), ViewStore::load(&path).active("/a.db")] {
+            assert_eq!(back.groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["Hand"], "the hand edit survives");
+            assert_eq!(back.group_pull, 0.4);
+            assert_eq!(back.dailies, DailiesMode::Hide, "and navi's own edit");
+            assert_eq!(back.orphans, OrphansMode::Hide, "both changed it: navi's");
+        }
+        assert_eq!(s.views("/a.db").iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), vec!["Default", "Typed"]);
+        assert!(!dir.join("views.json.bad").exists());
+        // nothing new: polling takes nothing
+        assert!(!s.changed_on_disk() && !s.sync().unwrap());
+
+        // a typo drops content: nothing is taken from it, the original is backed up
+        let text = std::fs::read_to_string(&path).unwrap().replace("\"Hand\"", "7");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, &text).unwrap();
+        assert!(!s.sync().unwrap());
+        assert_eq!(s.active("/a.db").groups.len(), 1, "a bad hand edit never deletes a group here");
+        assert!(dir.join("views.json.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_root_is_kept_per_db() {
+        let dir  = tmp("root");
+        let path = dir.join("views.json");
+        let mut s = ViewStore::load(&path);
+        assert_eq!(s.notes_root("/a.db"), None);
+        assert!(s.set_notes_root("/a.db", "/Users/me/notes"));
+        assert!(!s.set_notes_root("/a.db", "/Users/me/notes"), "unchanged");
+        s.ensure_db("/a.db", None);
+        s.save().unwrap();
+        assert_eq!(ViewStore::load(&path).notes_root("/a.db").as_deref(), Some("/Users/me/notes"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

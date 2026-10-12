@@ -82,15 +82,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = expand_tilde(&cfg.db);
 
     // Views (groups + filters) live in views.json per canonical db path. The
-    // first time a db has none, its Default view takes the filter keys an
-    // older config.json carried; those leave config.json only once
-    // views.json holding them is safely written.
+    // filter keys an older config.json carried move to views.json
+    // (`legacy_filters`), where every db's first view starts from them, this
+    // one's now and any opened later (another "db", ORG_ROAM_DB, a path fixed
+    // after a failed first run); they leave config.json only once views.json
+    // holding them is safely written.
     let mut views = ViewStore::load(&ViewStore::default_path());
     let key = db_key(&db_path);
     let legacy = cfg.legacy_view();
-    if views.ensure_db(&key, legacy.as_ref()) {
+    if views.ensure_db(&key, legacy.as_ref()) || legacy.is_some() {
         match views.save() {
-            Ok(()) => if legacy.is_some() { cfg.clear_legacy_view(); },
+            Ok(_) => if legacy.is_some() { cfg.clear_legacy_view(); },
             Err(e) => eprintln!("navi: couldn't write {}: {e}", views.path.display()),
         }
     }
@@ -112,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             eprintln!("navi: failed to load {db_path}: {e}");
             let msg = format!(
-                "No org-roam db at {db_path}. Set \"db\" in {}, then press W to reload",
+                "No org-roam db at {db_path}. Set \"db\" in {} and restart navi, or press W once the db exists there",
                 Config::config_path().display()
             );
             (Graph::new(Vec::new(), Vec::new()), Some(msg))

@@ -56,19 +56,25 @@ All notable changes to Navi are documented here.
   (also while a large graph's communities recompute in the background,
   where the previous partition keeps showing). Hiding a component or
   community stays with that cluster: it's keyed by one of its notes, not
-  its size rank, and stays hidden after another view was shown. Ungrouped
+  its size rank, and stays hidden after another view was shown. When the
+  note its key names leaves (a daily hub under Dailies Hide, a deleted
+  note), the cluster that is left keeps the key, its colour and its hiding,
+  and unhiding a cluster merged from two hidden ones takes one click. Ungrouped
   nodes keep the theme's node colour, and orphans are in no component or
   community.
 - **Query language** for the search box and group queries: `tag:`, `dir:`,
   `path:`, `file:`, `title:` (text or `/regex/`), `alias:`, `level:`,
-  `degree:`, `prop:KEY=VAL`, `daily`, `orphan`, `dangling`, `AND` / `OR` /
-  `NOT` / `-`, parentheses and quoted phrases. Plain words still search
+  `degree:`, `prop:KEY=VAL` (and `prop:KEY="two words"`), `daily`,
+  `orphan`, `dangling`, `AND` / `OR` / `NOT` / `-`, parentheses and quoted
+  phrases; a regex may end in `i` (`/draft/i`). Plain words still search
   titles and aliases, and so does text that only looks like syntax
   (`Rust - Ownership`, `Path: x`; in the search box bare `daily` also finds
   "Daily Review", while in a group it is the predicate alone). Search text that doesn't parse
   (`(draft`) is matched as plain text with the error and its column in the
   status bar; a group query that doesn't parse matches nothing and shows
-  why. `path:` takes absolute paths, and an absolute `dir:` ignores the
+  why, and so does a group with an empty query ("Add group" with nothing
+  searched never takes the whole graph). A closing quote must end its
+  term (`title:"a"b` is an error, not two terms). `path:` takes absolute paths, and an absolute `dir:` ignores the
   case of the notes root (`C:` / `c:`). While typing, the status bar counts
   matches.
 - **Views**: named sets of groups and filters per db in
@@ -80,7 +86,11 @@ All notable changes to Navi are documented here.
   doesn't know (a newer navi's, or your own) are kept on save. Saves are
   atomic, write through a symlinked file, keep what another navi window
   saved for another db, and a failed save is retried instead of dropped. A db that
-  doesn't exist yet keys the same as it will once it does.
+  doesn't exist yet keys the same as it will once it does. Editing
+  views.json by hand while navi runs works: the change shows within a
+  second, and navi's next save keeps every setting it didn't change too.
+  The notes root is remembered per db, so a folder that empties never
+  re-keys the folder groups or re-aims `dir:`.
 - `Shift-G` cycles the automatic grouper; a legend (top left) lists the
   groups with how many of their nodes are on screen while groups are shown.
 
@@ -112,7 +122,8 @@ All notable changes to Navi are documented here.
 - The `dailies`, `orphans` and `links_to_dailies_count` settings moved from
   `config.json` into the active view. Existing values carry over on the
   first run, and leave `config.json` only after `views.json` holding them
-  is written. `config.json` is now saved atomically too, and through a
+  is written; `views.json` keeps them (`legacy_filters`) for every db
+  opened later too. `config.json` is now saved atomically too, and through a
   symlink (a dotfiles repo's copy stays the one in use).
 - Group pull is weak by default (`group_pull: 0.1`) so links between groups
   stay readable; it pauses like the rest of the physics once things settle.
@@ -131,9 +142,27 @@ All notable changes to Navi are documented here.
   script points uploads at the Codeberg releases page.
 - `views.json` is written shortly after the last edit (typing a query
   doesn't write once per key) and again on exit; every write is atomic.
+- Picking a grouper in the panel's "Group by" turns the group display on,
+  as `Shift-G` does. The `H` controls overlay is drawn over the whole
+  window and narrows to fit it, so the side panel never cuts it off.
+- Off-screen hulls cost nothing: they are culled before they are built,
+  and zooming re-pads the cached outline instead of rebuilding it.
+  Community detection below 500 notes stays inline (well under a
+  millisecond), larger graphs go to the background worker, a request
+  queued there is dropped once nothing asks for communities, and the last
+  few partitions are kept, so going back to a resolution is instant.
+- macOS: `ARCH=universal` builds again with rustup's toolchain (its proc
+  macros are left unstripped, which dyld refused to load), and an
+  unnotarized package (`NAVI_ALLOW_UNNOTARIZED=1`) is named
+  `-unnotarized.zip`, never replacing the release zip.
+- The missing-db message says what works: set `"db"` and restart navi, or
+  press `W` once the db exists at the path shown. The README no longer
+  claims the old `org-roam-graph` config path is read.
 
 ### Fixed
 
+- `Escape` quits with the panel closed: a rename or delete prompt left open
+  when the panel closed used to take the first `Escape`.
 - **Orphans are judged on what's on screen**: hiding dailies left notes
   whose only links were to dailies sitting isolated, and the orphan filter
   didn't hide them. Orphan status now comes from the filtered graph, and

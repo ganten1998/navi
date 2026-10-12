@@ -23,9 +23,11 @@
 //! bare text: a word whose prefix before `:` is not a key
 //! (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone
 //! `-` (`Book - Chapter`). A value starting with `/` is a regex only when its
-//! closing `/` ends the term (`path:/n/posts` is a path). Operators are upper
-//! case; `and` / `or` / `not` are ordinary words. Text matching and regexes
-//! ignore case (`(?-i)` inside a regex turns that off).
+//! closing `/` (or a trailing `i`, `/foo/i`) ends the term (`path:/n/posts`
+//! is a path). `prop:KEY="two words"` quotes the value after `=`; a closing
+//! quote must end its term (`"a"b` is an error, not two terms). Operators
+//! are upper case; `and` / `or` / `not` are ordinary words. Text matching
+//! and regexes ignore case (`(?-i)` inside a regex turns that off).
 //!
 //! Parsing never panics: every error carries the character column it was
 //! found at. The search box uses `Query::search`, which falls back to the old
@@ -36,7 +38,7 @@ use regex::{Regex, RegexBuilder};
 use std::fmt;
 
 use crate::graph::Graph;
-use crate::view::{dir_components, notes_root_depth, ViewState};
+use crate::view::{dir_components, ViewState};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -167,16 +169,26 @@ fn read_delimited(cs: &[char], i: usize, what: &str) -> Result<(String, usize), 
 }
 
 /// A `/regex/` at `cs[i]`, only when its closing `/` ends the term (end of
-/// input, space or a paren); otherwise (`/n/posts`) None: it is a word. An
-/// unterminated one is an error, or a word too when `lenient` (path-like
-/// values, where `/tmp` is a path).
+/// input, space or a paren); otherwise (`/n/posts`) None: it is a word. A
+/// trailing `i` (`/foo/i`, the JS habit) is accepted: matching ignores case
+/// anyway. An unterminated one is an error, or a word too when `lenient`
+/// (path-like values, where `/tmp` is a path and `/n/i` a folder).
 fn whole_regex(cs: &[char], i: usize, lenient: bool) -> Result<Option<(String, usize)>, QueryError> {
+    let ends = |j: usize| j >= cs.len() || is_sep(cs[j]);
     match read_delimited(cs, i, "regex (missing closing /)") {
-        Ok((s, j)) if j >= cs.len() || is_sep(cs[j]) => Ok(Some((s, j))),
+        Ok((s, j)) if ends(j) => Ok(Some((s, j))),
+        Ok((s, j)) if !lenient && cs[j] == 'i' && ends(j + 1) => Ok(Some((s, j + 1))),
         Ok(_) => Ok(None),
         Err(_) if lenient => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// A closing quote at `cs[j - 1]` must end its term: `title:"a"b` or
+/// `"x"y` would otherwise split silently into two terms.
+fn quote_ends_term(cs: &[char], j: usize) -> Result<(), QueryError> {
+    if j < cs.len() && !is_sep(cs[j]) { return err(j, "a closing quote ends the term: add a space after it"); }
+    Ok(())
 }
 
 fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
@@ -194,6 +206,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
             '-' if i + 1 < cs.len() && !cs[i + 1].is_whitespace() && cs[i + 1] != ')' => { out.push((Tok::Minus, i)); i += 1; continue; }
             '"' => {
                 let (s, j) = read_delimited(&cs, i, "quote")?;
+                quote_ends_term(&cs, j)?;
                 out.push((Tok::Term { key: None, val: Val::Quoted(s), vpos: i }, start));
                 i = j; continue;
             }
@@ -220,11 +233,18 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
                 let regex = if cs[v] == '/' && key != "dir" { whole_regex(&cs, v, path_like)? } else { None };
                 let (val, j) = match (cs[v], regex) {
                     (_, Some((s, j))) => (Val::Regex(s), j),
-                    ('"', None) => { let (s, j) = read_delimited(&cs, v, "quote")?; (Val::Quoted(s), j) }
+                    ('"', None) => { let (s, j) = read_delimited(&cs, v, "quote")?; quote_ends_term(&cs, j)?; (Val::Quoted(s), j) }
                     _ => {
                         let mut j = v;
-                        while j < cs.len() && !is_sep(cs[j]) { j += 1; }
-                        (Val::Plain(cs[v..j].iter().collect()), j)
+                        while j < cs.len() && !is_sep(cs[j]) && !(key == "prop" && cs[j] == '"' && cs[j - 1] == '=') { j += 1; }
+                        if j < cs.len() && cs[j] == '"' {
+                            // prop:KEY="two words": the value after '=' quoted
+                            let (q, e) = read_delimited(&cs, j, "quote")?;
+                            quote_ends_term(&cs, e)?;
+                            (Val::Quoted(cs[v..j].iter().collect::<String>() + &q), e)
+                        } else {
+                            (Val::Plain(cs[v..j].iter().collect()), j)
+                        }
                     }
                 };
                 out.push((Tok::Term { key: Some(key), val, vpos: v }, start));
@@ -431,7 +451,7 @@ pub struct EvalCtx<'a> {
 
 impl<'a> EvalCtx<'a> {
     pub fn new(graph: &'a Graph, daily: &'a [bool], orphan: &'a [bool]) -> Self {
-        let depth = notes_root_depth(graph.node_list.iter().map(|n| n.file.as_str()));
+        let depth = graph.notes_root_depth();
         let root  = graph.node_list.first()
             .map(|n| dir_components(&n.file).take(depth).filter(|c| !c.is_empty()).map(|c| c.to_string()).collect())
             .unwrap_or_default();
@@ -853,5 +873,41 @@ mod tests {
         assert_eq!(ids(&g, r"title:/\(draft\)/"), vec!["o"], "regex escapes reach the engine");
         assert!(Query::parse(r#"title:"say \"hi\"""#).is_ok());
         assert!(Query::parse(r"title:/a\/b/").is_ok(), "escaped slash inside a regex");
+    }
+
+    /// `prop:KEY="two words"` quotes the value after `=`; a closing quote
+    /// that doesn't end its term is an error, never a silent second term.
+    #[test]
+    fn quoted_prop_values_and_quotes_that_end_terms() {
+        let mut g = fixture();
+        g.node_list[0].properties.push(("STATUS".into(), "In Progress".into()));
+        assert_eq!(ids(&g, r#"prop:status="in progress""#), vec!["r"]);
+        assert_eq!(ids(&g, r#"prop:"status=in progress""#), vec!["r"], "the older spelling still works");
+        assert_eq!(ids(&g, r#"prop:status="in progress" tag:lang"#), vec!["r"]);
+        assert_eq!(ids(&g, "prop:category=lang"), vec!["r"]);
+        assert_eq!(ids(&g, r#"prop:category=la"ng"#), Vec::<String>::new(), "a quote inside a word is text");
+        for (q, col) in [(r#"title:"a"b"#, 9), (r#""x"y"#, 3), (r#"prop:status="a"b"#, 15)] {
+            let e = perr(q);
+            assert_eq!(e.pos, col, "{q}: {e}");
+            assert!(e.msg.contains("closing quote"), "{q}: {e}");
+            let (_, err) = Query::search(q);
+            assert!(err.is_some(), "{q}: the search box says why");
+        }
+        assert!(Query::parse(r#"(title:"a")"#).is_ok(), "a paren ends a term");
+        assert!(perr(r#"prop:status="open"#).msg.contains("unterminated"));
+    }
+
+    /// A trailing `i` on a regex (`/foo/i`) is accepted (matching ignores
+    /// case anyway); on a path it stays a path.
+    #[test]
+    fn a_regex_takes_a_trailing_i() {
+        let g = fixture();
+        assert_eq!(ids(&g, "title:/^RUST/i"), vec!["r"]);
+        assert_eq!(ids(&g, "/rust notes/i"), vec!["r"]);
+        assert_eq!(ids(&g, "(title:/first/i)"), vec!["p"]);
+        assert!(Query::search("/rust/i").1.is_none(), "no error");
+        assert_eq!(ids(&g, "title:/rust/ix"), Vec::<String>::new(), "other suffixes: a word, as before");
+        let paths = Graph::new(vec![node("a", "A", "/n/i/a.org", &[])], vec![]);
+        assert_eq!(ids(&paths, "path:/n/i"), vec!["a"], "a path, not a regex");
     }
 }

@@ -493,3 +493,89 @@ fn a_long_auto_group_list_builds_only_visible_rows() {
     assert_eq!(h.app.groups.groups.len(), 400);
     assert!(n < 200, "{n} widgets for 400 groups");
 }
+
+/// A rename or delete prompt left open when the panel closes is dropped:
+/// Escape with the panel closed quits, first time.
+#[test]
+fn a_prompt_hidden_with_the_panel_never_takes_escape() {
+    for rename in [false, true] {
+        let mut h = Harness::new(if rename { "hidden-rename" } else { "hidden-delete" }, false);
+        h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+        if rename { h.app.panel.rename = Some("Default".into()); } else { h.app.panel.confirm_delete = true; }
+        h.frame(vec![]);
+        h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+        assert!(!h.app.active_view.panel_open);
+        assert!(h.app.panel.rename.is_none() && !h.app.panel.confirm_delete, "closing the panel drops its prompt");
+        h.key(Key::Escape, Modifiers::NONE, None);
+        assert!(h.app.quit_requested, "Escape quits");
+    }
+}
+
+/// "Add group" with no search makes a group that matches nothing yet: the
+/// graph keeps its colours, and hiding the group hides nothing.
+#[test]
+fn add_group_with_no_search_takes_nothing() {
+    let mut h = Harness::new("addempty", false);
+    h.app.active_view.auto = AutoGrouper::Component;
+    h.app.active_view.colour_groups = true;
+    h.app.groups_changed();
+    h.frame(vec![]);
+    let before = h.app.node_colours.clone();
+    assert!(h.app.last_search.is_empty() && !h.app.search_active);
+    panel::add_group(&mut h.app, [0, 0, 0]);
+    h.app.groups_changed();
+    h.frame(vec![]);
+    assert_eq!(h.app.active_view.groups[0].query, "");
+    assert_eq!(h.app.groups.groups[0].members, 0);
+    assert_eq!(h.app.node_colours, before, "no node takes the new group's colour");
+    h.app.active_view.groups[0].visible = false;
+    h.app.groups_changed();
+    h.frame(vec![]);
+    assert_eq!(h.app.view.visible.iter().filter(|&&v| v).count(), 4, "nothing hidden");
+}
+
+/// The panel's "Group by", like Shift-G, turns the group display on.
+#[test]
+fn choosing_a_grouper_in_the_panel_shows_groups() {
+    let mut v = View::named("V");
+    assert!(!v.colour_groups);
+    panel::choose_grouper(&mut v, AutoGrouper::Tag);
+    assert_eq!((v.auto, v.colour_groups), (AutoGrouper::Tag, true));
+    v.colour_groups = false;
+    panel::choose_grouper(&mut v, AutoGrouper::None);
+    assert!(!v.colour_groups, "None leaves it as it is");
+}
+
+/// The controls overlay fits the window: a narrow one narrows it, and no
+/// key label starts left of the window.
+#[test]
+fn the_controls_overlay_fits_a_narrow_window() {
+    for w in [395.0_f32, 400.0, 735.0, 1400.0] {
+        let r = Rect::from_min_size(Pos2::new(10.0, 0.0), Vec2::new(w, 800.0));
+        let (x, pw, val) = help_columns(r);
+        assert!(x >= r.left() && x + pw <= r.right() + 0.5, "{w}: {x} + {pw}");
+        assert!(val < pw && val > 100.0, "{w}: value column {val}");
+    }
+    assert_eq!(help_columns(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 800.0))).1, 510.0);
+}
+
+/// views.json edited by hand while navi runs: the working view takes the
+/// edit, and navi's next save keeps it.
+#[test]
+fn a_hand_edit_of_views_json_reaches_the_graph() {
+    let mut h = Harness::new("handedit", false);
+    h.app.views_dirty_at = Some(Instant::now());
+    h.app.flush_views(true);
+    let path = h.dir.join("views.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("\"groups\": []").count(), 1, "{text}");
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&path, text.replace("\"groups\": []", r#""groups": [ { "name": "Hand", "query": "Alpha" } ]"#)).unwrap();
+    h.app.views_polled_at = Instant::now() - VIEWS_POLL;
+    h.frame(vec![]);
+    assert_eq!(h.app.active_view.groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["Hand"]);
+    assert_eq!(h.app.groups.groups[0].members, 1, "and the graph shows it");
+    h.key(Key::D, Modifiers::NONE, Some("d"));
+    let saved = h.saved();
+    assert!(saved.contains("\"Hand\"") && saved.contains("\"dailies\": \"hide\""), "{saved}");
+}

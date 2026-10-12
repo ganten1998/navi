@@ -204,6 +204,23 @@ pub fn notes_root_depth<'a>(files: impl IntoIterator<Item = &'a str>) -> usize {
     root.len()
 }
 
+/// `notes_root_depth`, or the depth of `pin` (a root remembered from an
+/// earlier graph, "/Users/me/notes") while the files' own root is at or below
+/// it. So the root never moves deeper when a top-level folder empties or the
+/// last top-level note goes (that would re-key every folder group and
+/// re-aim every relative `dir:`), yet notes moved somewhere else entirely
+/// get their new root.
+pub fn pinned_root_depth<'a>(files: impl IntoIterator<Item = &'a str>, pin: Option<&str>) -> usize {
+    let mut files = files.into_iter().peekable();
+    let first = files.peek().copied();
+    let depth = notes_root_depth(files);
+    let (Some(pin), Some(first)) = (pin.filter(|p| !p.is_empty()), first) else { return depth };
+    let pin: Vec<&str> = pin.split(['/', '\\']).collect();
+    let pin = if pin.len() > 1 && pin.last() == Some(&"") { &pin[..pin.len() - 1] } else { &pin[..] }; // "/x/notes/"
+    let under = pin.len() <= depth && dir_components(first).zip(pin).all(|(a, b)| a == *b);
+    if under { pin.len() } else { depth }
+}
+
 /// A daily note: date title (`YYYY-MM-DD`), or a DIRECTORY component of its
 /// path, below the first `root_depth` components (see `notes_root_depth`),
 /// equal to one of `dirs` (whole component, ASCII case-insensitive; `/` and
@@ -225,7 +242,7 @@ pub fn compute_view_hiding(g: &Graph, f: &ViewFilter, hidden: &[bool]) -> ViewSt
     let hidden = |i: usize| hidden.len() == n && hidden[i];
 
     // 1. attribute filters
-    let root  = notes_root_depth(g.node_list.iter().map(|nd| nd.file.as_str()));
+    let root  = g.notes_root_depth();
     let daily: Vec<bool> = g.node_list.iter().map(|nd| is_daily(&nd.title, &nd.file, root, &f.dailies_dirs)).collect();
     let pass:  Vec<bool> = daily.iter().enumerate().map(|(i, &d)| !(d && f.dailies == DailiesMode::Hide) && !hidden(i)).collect();
 
@@ -359,6 +376,15 @@ mod tests {
         assert_eq!(notes_root_depth(["/a/x.org"]), 2, "one file: its own directory");
         assert_eq!(notes_root_depth(std::iter::empty::<&str>()), 0);
         assert_eq!(notes_root_depth(["/a/x.org", "rel.org"]), 0);
+        // pinned: never deeper than the remembered root, unless the notes moved away from it
+        let left = ["/r/work/a/w1.org", "/r/work/b/w2.org"];
+        assert_eq!(pinned_root_depth(left, None), 3);
+        assert_eq!(pinned_root_depth(left, Some("/r")), 2, "the last /r/home note went: still /r");
+        assert_eq!(pinned_root_depth(left, Some("/r/")), 2);
+        assert_eq!(pinned_root_depth(["/elsewhere/x.org"], Some("/r")), 2, "moved: their own root");
+        assert_eq!(pinned_root_depth(["/r/x.org", "/q/y.org"], Some("/r")), 1, "a note outside: shallower");
+        assert_eq!(pinned_root_depth(["c:\\n\\w\\x.org"], Some("c:/n")), 2, "either separator");
+        assert_eq!(pinned_root_depth(std::iter::empty::<&str>(), Some("/r")), 0);
 
         // through compute_view: every note under ~/Journal/roam stays a note
         let g = Graph::new(vec![node("n", "Note", mac[0]), node("b", "B", mac[1]), node("s", "Standup", mac[2])], vec![]);

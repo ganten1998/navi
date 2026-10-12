@@ -52,6 +52,7 @@ pub struct Graph {
     pub adj:        Vec<Vec<usize>>,      // over `edges`
     pub dangling:   Vec<DanglingLink>,
     pub link_stats: LinkStats,
+    pub root_pin:   Option<String>,       // the notes root remembered for this db (views.json): see `notes_root_depth`
     pub physics_on: bool,
     pub step_count: u64,
     // ── view: set by apply_view(); everything visible until then ──
@@ -163,7 +164,7 @@ impl Graph {
         }
 
         let mut g = Graph {
-            nodes, node_list, edges, adj, dangling: Vec::new(), link_stats: LinkStats::default(),
+            nodes, node_list, edges, adj, dangling: Vec::new(), link_stats: LinkStats::default(), root_pin: None,
             physics_on: true, step_count: 0,
             visible: Vec::new(), vis_idx: Vec::new(), vis_edges: Vec::new(), vis_adj: Vec::new(),
             vis_local: Vec::new(), vis_layout: Vec::new(), local_of: Vec::new(),
@@ -188,6 +189,24 @@ impl Graph {
         let mut g = Graph::new_with_view(data.nodes, data.edges, filter);
         g.set_dangling(dangling, stats);
         g
+    }
+
+    /// Directory components of the notes root (≈ org-roam-directory): the
+    /// files' deepest shared folder, or `root_pin` while they are all under
+    /// it (see `view::pinned_root_depth`). Folder groups, `dir:` and the
+    /// dailies dirs are relative to it.
+    pub fn notes_root_depth(&self) -> usize {
+        crate::view::pinned_root_depth(self.node_list.iter().map(|nd| nd.file.as_str()), self.root_pin.as_deref())
+    }
+
+    /// The notes root as a path ("/Users/me/notes"; `/`-joined), what
+    /// `root_pin` holds. None for an empty graph.
+    pub fn notes_root_path(&self) -> Option<String> {
+        let first = self.node_list.first()?;
+        let mut file = first.file.split(['/', '\\']).collect::<Vec<&str>>();
+        file.pop(); // the file name
+        file.truncate(self.notes_root_depth());
+        Some(file.join("/"))
     }
 
     /// Keep the db's dangling links and count them per source node.

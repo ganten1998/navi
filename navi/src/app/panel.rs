@@ -15,7 +15,7 @@ use egui::{Align, Color32, CursorIcon, Layout, Pos2, RichText, Sense, Stroke, Te
 use navi_core::{
     groups::{luminance, new_group_colour, AutoGrouper, CommunityScope, Group, GroupColour},
     view::relative_to_root,
-    DailiesMode, OrphansMode, Query,
+    DailiesMode, OrphansMode, Query, View,
 };
 
 use super::NaviApp;
@@ -343,6 +343,7 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
     // the automatic grouper
     ui.add_space(4.0);
     let v = &mut app.active_view;
+    let (groups, graph) = (&app.groups, &app.graph);
     ui.horizontal(|ui| {
         ui.label("Group by");
         let kinds = [
@@ -357,7 +358,7 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
         egui::ComboBox::from_id_salt("navi-auto-grouper").selected_text(name(&v.auto)).width(130.0).show_ui(ui, |ui| {
             for k in kinds {
                 let selected = std::mem::discriminant(&k) == std::mem::discriminant(&v.auto);
-                if ui.selectable_label(selected, name(&k)).clicked() && !selected { v.auto = k; out.groups = true; }
+                if ui.selectable_label(selected, name(&k)).clicked() && !selected { choose_grouper(v, k); out.groups = true; }
             }
         }).response.on_hover_text("Shift-G cycles");
     });
@@ -365,18 +366,19 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
         AutoGrouper::Folder { depth } => {
             ui.horizontal(|ui| {
                 ui.label(weak(t, "Folder depth"));
-                if ui.add(egui::DragValue::new(depth).range(1..=8)).changed() { out.groups = true; }
+                if ui.add(egui::DragValue::new(depth).range(1..=8)).changed() { v.colour_groups = true; out.groups = true; }
             });
         }
         AutoGrouper::Community { resolution, scope } => {
-            if ui.add(egui::Slider::new(resolution, 0.1..=5.0).logarithmic(true).text("resolution"))
-                .on_hover_text("Above 1: more, smaller communities").changed() { out.groups = true; }
+            let mut changed = ui.add(egui::Slider::new(resolution, 0.1..=5.0).logarithmic(true).text("resolution"))
+                .on_hover_text("Above 1: more, smaller communities").changed();
             ui.horizontal(|ui| {
                 ui.label(weak(t, "Computed on"));
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if ui.selectable_value(scope, CommunityScope::All, "All links").on_hover_text("Every real link: communities don't move when a filter changes").changed() { out.groups = true; }
-                if ui.selectable_value(scope, CommunityScope::Visible, "Visible").on_hover_text("Only what the dailies filter leaves").changed() { out.groups = true; }
+                changed |= ui.selectable_value(scope, CommunityScope::All, "All links").on_hover_text("Every real link: communities don't move when a filter changes").changed();
+                changed |= ui.selectable_value(scope, CommunityScope::Visible, "Visible").on_hover_text("Only what the dailies filter leaves").changed();
             });
+            if changed { v.colour_groups = true; out.groups = true; }
         }
         _ => {}
     }
@@ -412,7 +414,11 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
                                     ui.set_min_height(row_h);
                                     let mut vis = !v.auto_hidden.contains(&row.key);
                                     if ui.checkbox(&mut vis, "").on_hover_text("Visible").changed() {
-                                        if vis { v.auto_hidden.retain(|k| k != &row.key); } else { v.auto_hidden.push(row.key.clone()); }
+                                        if vis {
+                                            // every key hiding it (a merge of two hidden clusters has two): one click shows it
+                                            let drop = groups.hiding_keys(graph, &row.key, &v.auto_hidden);
+                                            v.auto_hidden.retain(|k| !drop.contains(k));
+                                        } else { v.auto_hidden.push(row.key.clone()); }
                                         out.groups = true;
                                     }
                                     let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
@@ -427,6 +433,13 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
         }
         app.panel.autos = Some((at, autos));
     }
+}
+
+/// The panel's "Group by": as Shift-G, a grouper turns the group display on
+/// (one you can't see would look like nothing happened).
+pub(super) fn choose_grouper(v: &mut View, k: AutoGrouper) {
+    v.auto = k;
+    if k != AutoGrouper::None { v.colour_groups = true; }
 }
 
 /// "Add group" starts from the search being typed, else the last one, as a

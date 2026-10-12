@@ -2,7 +2,7 @@ use egui::{Color32, Key, Pos2, Rect, Sense, Stroke, Vec2, epaint::FontId};
 use navi_core::{
     config::Config,
     groups::{AutoGrouper, GroupResolution, GroupSpec, Grouping},
-    load_graph, view::notes_root_depth, DailiesMode, EmacsClient, EvalCtx, Graph, GraphData, OrphansMode, Query,
+    load_graph, DailiesMode, EmacsClient, EvalCtx, Graph, GraphData, OrphansMode, Query,
     QueryError, View, ViewFilter, ViewState, ViewStore,
 };
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ const PAN_DECAY: f32 = 0.92;
 const BASE_DT: f32 = 1.0 / 60.0;
 const STATUS_H: f32 = 30.0;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600); // views.json writes after the last edit
+const VIEWS_POLL:    Duration = Duration::from_millis(700); // how often views.json is checked for a hand edit
 
 
 pub struct NaviApp {
@@ -55,6 +56,7 @@ pub struct NaviApp {
     db_key:      String,                                // this db's key in views.json
     active_view: View,                                  // working copy of the active view
     views_dirty_at: Option<Instant>,                    // unsaved edits (debounced save)
+    views_polled_at: Instant,                           // views.json last checked for an outside edit
 
     // ── side panel (backslash) ──
     panel:         PanelState,
@@ -156,6 +158,7 @@ impl NaviApp {
             db_key,
             active_view,
             views_dirty_at: None,
+            views_polled_at: Instant::now(),
             panel: PanelState::default(),
             kb_focus_prev: false,
             tab_to_graph: false,
@@ -214,6 +217,7 @@ impl NaviApp {
         };
         // main.rs built the graph with Graph::from_data_with_view, so the
         // visible subset of a persisted filter is already laid out on its own.
+        app.pin_root();
         app.refresh_view();
         // positions_disk() already pre-relaxes internally, so nodes are at
         // equilibrium.  Resume physics with an ease-in so nothing snaps.
@@ -276,12 +280,54 @@ impl NaviApp {
         let Some(at) = self.views_dirty_at else { return };
         if !force && at.elapsed() < SAVE_DEBOUNCE { return; }
         match self.views.save() {
-            Ok(()) => self.views_dirty_at = None,
+            Ok(outside) => {
+                self.views_dirty_at = None;
+                if outside { self.adopt_outside_edit(); }
+            }
             Err(e) => {
                 self.views_dirty_at = self.views.writable().then(Instant::now);
                 self.set_msg(format!("Couldn't save {}: {e}", self.views.path.display()), Duration::from_secs(6));
             }
         }
+    }
+
+    /// views.json changed outside navi (a hand edit, another window): take it
+    /// in now, before an edit here is saved over it. A stat every VIEWS_POLL.
+    fn poll_views_file(&mut self) {
+        if self.views_polled_at.elapsed() < VIEWS_POLL { return; }
+        self.views_polled_at = Instant::now();
+        if !self.views.changed_on_disk() { return; }
+        match self.views.sync() {
+            Ok(true) => self.adopt_outside_edit(),
+            Ok(false) => {}
+            Err(e) => eprintln!("navi: couldn't read {}: {e}", self.views.path.display()),
+        }
+    }
+
+    /// The store took an outside edit of this db's views: the working view,
+    /// its filter, groups and the colour memory follow, and the graph shows
+    /// them (a prompt or drag in the panel is dropped, as on a view switch).
+    fn adopt_outside_edit(&mut self) {
+        self.active_view = self.views.active(&self.db_key);
+        self.view_filter = self.active_view.filter(&self.cfg.dailies_dirs);
+        self.group_spec  = self.active_view.spec();
+        self.grouping.memory.slots = self.views.auto_colours(&self.db_key);
+        self.panel = PanelState::default();
+        self.colours_key = None;
+        self.popup = Some(("views.json changed: view reloaded".into(), self.now_secs));
+        self.view_dirty = true;
+        if self.refresh_view() { self.reform_layout(); }
+    }
+
+    /// The notes root: the one remembered for this db while every note is
+    /// still under it (a folder that empties never re-keys folder groups or
+    /// re-aims `dir:`), remembered again when it changes.
+    fn pin_root(&mut self) {
+        self.graph.root_pin = self.views.notes_root(&self.db_key);
+        if let Some(root) = self.graph.notes_root_path() {
+            if self.views.set_notes_root(&self.db_key, &root) { self.views_dirty_at = Some(Instant::now()); }
+        }
+        self.root_depth = None;
     }
 
     /// The window is closing (main.rs `exiting`): write any pending edit.
@@ -406,6 +452,12 @@ impl NaviApp {
     fn toggle_panel(&mut self) {
         self.active_view.panel_open = !self.active_view.panel_open;
         self.panel.drag_from = None;
+        if !self.active_view.panel_open {
+            // a rename or delete prompt you can't see would take the next Escape
+            self.panel.rename = None;
+            self.panel.rename_error = None;
+            self.panel.confirm_delete = false;
+        }
         self.store_view();
     }
 
@@ -422,7 +474,7 @@ impl NaviApp {
     /// Notes root depth (for paths relative to it), cached per view recompute.
     fn notes_root(&mut self) -> usize {
         if let Some((gen, d)) = self.root_depth { if gen == self.view_gen { return d; } }
-        let d = notes_root_depth(self.graph.node_list.iter().map(|nd| nd.file.as_str()));
+        let d = self.graph.notes_root_depth();
         self.root_depth = Some((self.view_gen, d));
         d
     }
@@ -672,6 +724,7 @@ impl NaviApp {
                     self.node_dragging = None;
                     self.last_click = None;
                     self.selected = old_sel.and_then(|s| self.graph.nodes.get(&s).copied());
+                    self.pin_root();
                     self.view_dirty = true;
                     self.refresh_view();
                     self.set_msg(format!("Reloaded: {nn} nodes  {ne} edges{diff}"), Duration::from_secs(3));
@@ -754,9 +807,10 @@ impl NaviApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        // Escape cancels a pending rename / delete in the panel (never quits
-        // past one), whether or not its field has the keyboard.
-        if (self.panel.rename.is_some() || self.panel.confirm_delete) && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        // Escape cancels a pending rename / delete in the open panel (never
+        // quits past one), whether or not its field has the keyboard.
+        let prompt = self.panel.rename.is_some() || self.panel.confirm_delete;
+        if prompt && self.active_view.panel_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.panel.rename = None;
             self.panel.rename_error = None;
             self.panel.confirm_delete = false;
@@ -1202,14 +1256,13 @@ impl NaviApp {
         ];
         let row_h = 22.0;
         let pad = 18.0;
-        let panel_w = 510.0;
+        let (panel_x, panel_w, val_x) = help_columns(rect);
         let head_h = 38.0;
         let n_rows = rows.iter().filter(|&&(k,v)| !k.is_empty()||!v.is_empty()).count();
         let n_gaps = rows.iter().filter(|&&(k,v)| k.is_empty()&&v.is_empty()).count();
         let panel_h = head_h + n_rows as f32 * row_h + n_gaps as f32 * row_h / 2.0 + pad;
 
         let ease = 1.0 - (1.0 - self.help_anim).powi(3);
-        let panel_x = rect.left() + (rect.width() - panel_w) / 2.0;
         let panel_y = rect.top() + (-panel_h * (1.0 - ease)) + 6.0;
         let panel_rect = Rect::from_min_size(Pos2::new(panel_x, panel_y), Vec2::new(panel_w, panel_h));
 
@@ -1232,11 +1285,20 @@ impl NaviApp {
                 painter.text(Pos2::new(panel_x+pad, y+row_h/2.0), egui::Align2::LEFT_CENTER, key_s, font.clone(), col);
             }
             if !val_s.is_empty() {
-                painter.text(Pos2::new(panel_x+pad+215.0, y+row_h/2.0), egui::Align2::LEFT_CENTER, val_s, font, t.bar_text);
+                painter.text(Pos2::new(panel_x+pad+val_x, y+row_h/2.0), egui::Align2::LEFT_CENTER, val_s, font, t.bar_text);
             }
             y += row_h;
         }
     }
+}
+
+/// The controls overlay across `rect` (the window): (left, width, value
+/// column offset). 510 wide and centred; a narrower window narrows it and
+/// its value column, so no key label is ever cut off on the left.
+fn help_columns(rect: Rect) -> (f32, f32, f32) {
+    let w = 510.0_f32.min((rect.width() - 12.0).max(200.0));
+    let x = (rect.left() + (rect.width() - w) / 2.0).max(rect.left());
+    (x, w, 215.0_f32.min(w * 0.42))
 }
 
 impl NaviApp {
@@ -1331,6 +1393,7 @@ impl NaviApp {
 
         // ── Updates ───────────────────────────────────────────────────────────
         self.poll_reload();
+        self.poll_views_file();
 
         // Fixed 60 Hz physics — decoupled from render rate so vsync at any
         // frequency doesn't change how fast nodes move or how much CPU physics uses.
@@ -1449,7 +1512,11 @@ impl NaviApp {
                 if !no_labels && self.zoom > 0.25 { gp.paint_labels(&painter); }
                 let t_help   = Instant::now();
         if self.active_view.colour_groups { self.paint_legend(&painter, graph_rect, t); }
-                if self.help_anim > 0.01 { self.paint_help(&painter, graph_rect, t); }
+                if self.help_anim > 0.01 {
+                    // over the side panel too: the whole window, never clipped to the graph
+                    let over = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("navi-help")));
+                    self.paint_help(&over, ui.ctx().screen_rect(), t);
+                }
                 let t_end    = Instant::now();
 
                 if prof {
