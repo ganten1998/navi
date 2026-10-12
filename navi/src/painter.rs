@@ -1,5 +1,6 @@
-use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, epaint::FontId};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, epaint::FontId};
 use navi_core::{groups::{centroid, padded_hull}, Graph};
+use std::cell::{Ref, RefCell};
 use crate::theme::Theme;
 
 // ── Age ───────────────────────────────────────────────────────────────────────
@@ -70,11 +71,52 @@ fn dim(c: Color32, amt: u8) -> Color32 {
 // ── Painter ───────────────────────────────────────────────────────────────────
 
 /// A group whose hull is drawn: its colour, label and member nodes (the
-/// painter re-checks visibility and takes positions fresh each frame).
+/// painter re-checks visibility and positions each frame).
 pub struct HullDraw {
     pub colour:  Color32,
     pub label:   String,
     pub members: Vec<usize>,
+    geom:        RefCell<Option<HullGeom>>, // the last shape, while nothing moved
+}
+
+/// A hull's shape in world space and where its label goes.
+pub struct HullGeom {
+    key:          u64,              // fingerprint of the visible members' positions + the padding
+    pub poly:     Vec<(f64, f64)>,
+    pub label_at: (f64, f64),
+    pub shown:    usize,            // visible members
+}
+
+fn mix(h: u64, v: u64) -> u64 { (h ^ v).wrapping_mul(0x0100_0000_01b3) }
+
+impl HullDraw {
+    pub fn new(colour: Color32, label: String, members: Vec<usize>) -> Self {
+        HullDraw { colour, label, members, geom: RefCell::new(None) }
+    }
+
+    /// The padded hull of the visible members (None: none visible). Rebuilt
+    /// only when a member moved, appeared or left, or `pad` (it follows the
+    /// zoom) changed: a resting graph costs one pass over the members, not
+    /// two convex hulls per group per frame. One member: the label sits
+    /// above its circle, not under the node.
+    pub fn geometry(&self, g: &Graph, pad: f64) -> Option<Ref<'_, HullGeom>> {
+        let mut key = mix(0xcbf2_9ce4_8422_2325, pad.to_bits());
+        let mut shown = 0;
+        for &i in self.members.iter().filter(|&&i| g.is_visible(i)) {
+            let nd = &g.node_list[i];
+            key = mix(mix(mix(key, i as u64), nd.x.to_bits()), nd.y.to_bits());
+            shown += 1;
+        }
+        if shown == 0 { return None; }
+        if !matches!(self.geom.borrow().as_ref(), Some(h) if h.key == key) {
+            let pts: Vec<(f64, f64)> = self.members.iter().copied().filter(|&i| g.is_visible(i))
+                .map(|i| (g.node_list[i].x, g.node_list[i].y)).collect();
+            let c = centroid(&pts).unwrap_or_default();
+            let label_at = if shown >= 2 { c } else { (c.0, c.1 - pad) };
+            *self.geom.borrow_mut() = Some(HullGeom { key, poly: padded_hull(&pts, pad, 16), label_at, shown });
+        }
+        Some(Ref::map(self.geom.borrow(), |h| h.as_ref().expect("just built")))
+    }
 }
 
 pub struct GraphPainter<'a> {
@@ -148,16 +190,14 @@ impl<'a> GraphPainter<'a> {
 
     /// Faint padded convex hulls behind the nodes, one per group with its
     /// hull on, over the group's visible members; the label sits at the
-    /// members' centroid. The padding covers node radius plus the breathing
-    /// wobble (4 px on screen).
+    /// members' centroid (above a lone member). The padding covers node
+    /// radius plus the breathing wobble (4 px on screen).
     pub fn paint_hulls(&self, painter: &Painter) {
         let r   = self.graph_rect.expand(40.0);
         let pad = (navi_core::graph::R_MAX as f64 + 10.0) + 6.0 / self.zoom.max(0.01) as f64;
         for h in self.hulls {
-            let pts: Vec<(f64, f64)> = h.members.iter().copied().filter(|&i| self.graph.is_visible(i))
-                .map(|i| (self.graph.node_list[i].x, self.graph.node_list[i].y)).collect();
-            if pts.is_empty() { continue; }
-            let poly: Vec<Pos2> = padded_hull(&pts, pad, 16).into_iter().map(|(x, y)| self.w2s(x, y)).collect();
+            let Some(geo) = h.geometry(self.graph, pad) else { continue };
+            let poly: Vec<Pos2> = geo.poly.iter().map(|&(x, y)| self.w2s(x, y)).collect();
             let bb = Rect::from_points(&poly);
             if !bb.intersects(r) { continue; }
             let c = h.colour;
@@ -165,10 +205,9 @@ impl<'a> GraphPainter<'a> {
                 Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 20),
                 Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 70))));
             if self.zoom > 0.12 {
-                if let Some((cx, cy)) = centroid(&pts) {
-                    painter.text(self.w2s(cx, cy), egui::Align2::CENTER_CENTER, &h.label, FontId::proportional(15.0),
-                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110));
-                }
+                let align = if geo.shown >= 2 { Align2::CENTER_CENTER } else { Align2::CENTER_BOTTOM };
+                painter.text(self.w2s(geo.label_at.0, geo.label_at.1), align, &h.label, FontId::proportional(15.0),
+                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110));
             }
         }
     }
@@ -325,5 +364,49 @@ impl<'a> GraphPainter<'a> {
             if d <= hr && d < best_d { best_d = d; best = Some(i); }
         }
         best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use navi_core::{compute_view, RawNode, ViewFilter};
+
+    fn graph() -> Graph {
+        let node = |id: &str| RawNode { id: id.into(), title: id.into(), file: format!("/n/{id}.org"), ..Default::default() };
+        let mut g = Graph::new(vec![node("a"), node("b"), node("c")], vec![("a".into(), "b".into())]);
+        let v = compute_view(&g, &ViewFilter::default());
+        g.apply_view(&v);
+        g
+    }
+
+    /// Nothing moved: the hull is not rebuilt. A member moved or the zoom
+    /// (padding) changed: it is.
+    #[test]
+    fn hull_geometry_is_cached_until_something_moves() {
+        let mut g = graph();
+        let h = HullDraw::new(Color32::RED, "ab".into(), vec![0, 1]);
+        let first = h.geometry(&g, 30.0).unwrap().poly.as_ptr();
+        assert_eq!(h.geometry(&g, 30.0).unwrap().poly.as_ptr(), first, "same positions: the cached shape");
+        g.node_list[1].x += 5.0;
+        let moved = h.geometry(&g, 30.0).unwrap().poly.clone();
+        assert!(moved.iter().any(|p| p.0 > g.node_list[1].x), "rebuilt around the new position");
+        let padded = h.geometry(&g, 60.0).unwrap().poly.clone();
+        assert_ne!(padded, moved, "a new padding rebuilds");
+        assert!(HullDraw::new(Color32::RED, "none".into(), vec![]).geometry(&g, 30.0).is_none());
+    }
+
+    /// A one-member group's label sits above its circle, not under the node.
+    #[test]
+    fn a_lone_members_label_sits_above_it() {
+        let g = graph();
+        let h = HullDraw::new(Color32::RED, "#solo".into(), vec![2]);
+        let geo = h.geometry(&g, 30.0).unwrap();
+        let nd = &g.node_list[2];
+        assert_eq!(geo.shown, 1);
+        assert_eq!(geo.label_at, (nd.x, nd.y - 30.0));
+        let two = HullDraw::new(Color32::RED, "pair".into(), vec![0, 1]);
+        let (a, b) = (&g.node_list[0], &g.node_list[1]);
+        assert_eq!(two.geometry(&g, 30.0).unwrap().label_at, ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
     }
 }

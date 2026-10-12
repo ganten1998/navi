@@ -3,7 +3,7 @@
 # and package the stapled app as Navi-<version>-<arch>.zip.
 #
 # Usage:
-#   scripts/build-macos.sh                # release build, host arch
+#   scripts/build-macos.sh                # release build, host arch (named by it: arm64)
 #   ARCH=universal scripts/build-macos.sh # arm64 + x86_64 universal binary
 #
 # Output: dist/Navi.app  and  dist/Navi-<version>-<arch>.zip
@@ -16,7 +16,7 @@
 #   NAVI_ALLOW_UNNOTARIZED=1  package a signed app even when notarization failed
 #   CARGO_TARGET_DIR          respected; defaults to ~/.cache/navi-target when
 #                             the repo lives in Dropbox (it breaks cargo linking)
-#   MACOSX_DEPLOYMENT_TARGET  default 11.0; also written as LSMinimumSystemVersion
+#   MACOSX_DEPLOYMENT_TARGET  default 14.0; also written as LSMinimumSystemVersion
 #
 # Requirements: Rust toolchain (rustup), Xcode CLT for codesign / ditto /
 # notarytool / stapler. For ARCH=universal:
@@ -36,13 +36,19 @@ VERSION="$(grep '^version' navi/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\
 # rejects it. File names keep the full string, the bundle gets the numeric core.
 VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 APP="dist/Navi.app"
-ZIP="dist/Navi-${VERSION}-${ARCH}.zip"
+# "host" names the zip after the machine's real arch, so nobody downloads an
+# arm64-only "host" build for an Intel Mac.
+ZIP_ARCH="$ARCH"; [ "$ARCH" != host ] || ZIP_ARCH="$(uname -m)"
+ZIP="dist/Navi-${VERSION}-${ZIP_ARCH}.zip"
 BUNDLE_ID="com.navi.graph"   # unchanged since 1.0: renaming it orphans prefs and TCC grants
 
 # One deployment target for both slices and the plist. rustc's defaults differ
 # per arch (aarch64 11.0, x86_64 10.12), which would leave a universal binary
-# disagreeing with its own LSMinimumSystemVersion.
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+# disagreeing with its own LSMinimumSystemVersion. 14.0 because the frame
+# pacer (macos_display.rs) calls NSScreen displayLinkWithTarget:selector: and
+# CADisplayLink, both macOS 14: on 11-13 they'd abort at launch, so the
+# plist must keep those systems from opening it at all.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
 # Cargo cannot link build scripts inside Dropbox ("Operation not permitted").
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
@@ -239,7 +245,10 @@ if [ "$SIGNED_RELEASE" = 1 ]; then
   NOTARY_LOG="$NOTARY_DIR/submit.log"
   SUBMISSION_ID=""
   echo "==> Notarizing with profile '$NOTARY_PROFILE' (waits on Apple; typically 1-5 minutes)"
-  ditto -c -k --sequesterRsrc --keepParent "$APP" "$NOTARY_DIR/Navi.zip"
+  # No xattrs or resource forks in either zip: dist/ is in Dropbox, which
+  # re-stamps its own (com.dropbox.*) on every file seconds after `xattr -cr`.
+  # Nothing they hold is sealed; the staple ticket is a file in the bundle.
+  ditto -c -k --norsrc --noextattr --keepParent "$APP" "$NOTARY_DIR/Navi.zip"
   # `submit --wait` can exit 0 on an Invalid verdict, so the exit status is not
   # the answer: read the id and status out of the log, then let the stapler and
   # spctl below have the final word.
@@ -248,8 +257,23 @@ if [ "$SIGNED_RELEASE" = 1 ]; then
   SUBMISSION_ID="$(awk '$1 == "id:" { print $2; exit }' "$NOTARY_LOG")"
   STATUS="$(awk '$1 == "status:" { s = $2 } END { print s }' "$NOTARY_LOG")"
   if [ "$STATUS" = "Accepted" ]; then
+    # Right after acceptance the ticket may not have reached the CDN yet
+    # (stapler Error 65, "Record not found"): retry instead of throwing the
+    # accepted submission away and notarizing all over again.
     echo "==> Stapling"
-    xcrun stapler staple "$APP"
+    STAPLED=0
+    for wait in 0 10 20 40 60; do
+      sleep "$wait"
+      if xcrun stapler staple "$APP"; then STAPLED=1; break; fi
+      echo "   stapling failed; retrying in a moment" >&2
+    done
+    if [ "$STAPLED" = 0 ]; then
+      echo "!! Notarization was ACCEPTED (submission id: $SUBMISSION_ID) but stapling kept failing." >&2
+      echo "   Later, staple and package by hand:" >&2
+      echo "     xcrun stapler staple $APP && ditto -c -k --norsrc --noextattr --keepParent $APP $ZIP" >&2
+      rm -rf "$NOTARY_DIR"
+      exit 1
+    fi
     xcrun stapler validate "$APP"
     NOTARIZED=1
   else
@@ -300,7 +324,7 @@ touch "$APP" "$APP/Contents/Info.plist"
 # ── Package ──────────────────────────────────────────────────────────────────
 echo "==> Packaging $ZIP"
 rm -f "$ZIP"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+ditto -c -k --norsrc --noextattr --keepParent "$APP" "$ZIP"
 
 du -h "$BIN" "$APP/Contents/MacOS/navi" "$ZIP" | sed 's/^/    /'
 if [ "$NOTARIZED" = 1 ]; then

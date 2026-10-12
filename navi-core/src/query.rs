@@ -6,7 +6,7 @@
 //! and    := unary ( "AND"? unary )*          implicit AND between terms
 //! unary  := ( "NOT" | "-" ) unary | atom
 //! atom   := "(" query ")" | term
-//! term   := key ":" value | "daily" | "orphan" | "dangling" | bare
+//! term   := key ":" value | bare
 //! value  := plain | "quoted text" | /regex/
 //! ```
 //!
@@ -16,13 +16,18 @@
 //! `degree:` (`N`, `=N`, `>N`, `<N`, `>=N`, `<=N`), `prop:KEY` / `prop:KEY=VAL`,
 //! `is:daily` / `is:orphan` / `is:dangling`. A bare word, a "quoted phrase"
 //! or a bare `/regex/` matches title or alias, case-insensitively, so plain
-//! search text behaves as it always did. A word whose prefix before `:` is
-//! not a key (`http://x`, `Rust:`) is bare text too. Operators are upper
+//! search text behaves as it always did. Bare `daily` / `orphan` / `dangling`
+//! match that predicate OR the word in a title or alias (`is:` for only the
+//! predicate). Also bare text: a word whose prefix before `:` is not a key
+//! (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone
+//! `-` (`Book - Chapter`). A value starting with `/` is a regex only when its
+//! closing `/` ends the term (`path:/n/posts` is a path). Operators are upper
 //! case; `and` / `or` / `not` are ordinary words. Text matching and regexes
 //! ignore case (`(?-i)` inside a regex turns that off).
 //!
 //! Parsing never panics: every error carries the character column it was
-//! found at.
+//! found at. The search box uses `Query::search`, which falls back to the old
+//! whole-text substring match when the text doesn't parse.
 
 use regex::{Regex, RegexBuilder};
 use std::fmt;
@@ -158,6 +163,19 @@ fn read_delimited(cs: &[char], i: usize, what: &str) -> Result<(String, usize), 
     err(i, format!("unterminated {what}"))
 }
 
+/// A `/regex/` at `cs[i]`, only when its closing `/` ends the term (end of
+/// input, space or a paren); otherwise (`/n/posts`) None: it is a word. An
+/// unterminated one is an error, or a word too when `lenient` (path-like
+/// values, where `/tmp` is a path).
+fn whole_regex(cs: &[char], i: usize, lenient: bool) -> Result<Option<(String, usize)>, QueryError> {
+    match read_delimited(cs, i, "regex (missing closing /)") {
+        Ok((s, j)) if j >= cs.len() || is_sep(cs[j]) => Ok(Some((s, j))),
+        Ok(_) => Ok(None),
+        Err(_) if lenient => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
     let cs: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -169,21 +187,18 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
         match c {
             '(' => { out.push((Tok::Open, i)); i += 1; continue; }
             ')' => { out.push((Tok::Close, i)); i += 1; continue; }
-            '-' => {
-                if i + 1 >= cs.len() || cs[i + 1].is_whitespace() || cs[i + 1] == ')' {
-                    return err(i, "'-' needs a term right after it (like -tag:x)");
-                }
-                out.push((Tok::Minus, i)); i += 1; continue;
-            }
+            // a lone '-' ("Book - Chapter") is a word; "-x" negates x
+            '-' if i + 1 < cs.len() && !cs[i + 1].is_whitespace() && cs[i + 1] != ')' => { out.push((Tok::Minus, i)); i += 1; continue; }
             '"' => {
                 let (s, j) = read_delimited(&cs, i, "quote")?;
                 out.push((Tok::Term { key: None, val: Val::Quoted(s), vpos: i }, start));
                 i = j; continue;
             }
             '/' => {
-                let (s, j) = read_delimited(&cs, i, "regex (missing closing /)")?;
-                out.push((Tok::Term { key: None, val: Val::Regex(s), vpos: i }, start));
-                i = j; continue;
+                if let Some((s, j)) = whole_regex(&cs, i, false)? {
+                    out.push((Tok::Term { key: None, val: Val::Regex(s), vpos: i }, start));
+                    i = j; continue;
+                }
             }
             _ => {}
         }
@@ -192,14 +207,17 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
         while k < cs.len() && cs[k].is_ascii_alphabetic() { k += 1; }
         if k > i && k < cs.len() && cs[k] == ':' {
             let key: String = cs[i..k].iter().collect::<String>().to_ascii_lowercase();
-            if KEYS.contains(&key.as_str()) {
-                let v = k + 1;
+            let v = k + 1;
+            // "Path: x" is text with a colon in it, not an empty key
+            if KEYS.contains(&key.as_str()) && !(v < cs.len() && cs[v].is_whitespace()) {
                 if v >= cs.len() || is_sep(cs[v]) {
                     return err(v, format!("'{key}:' needs a value"));
                 }
-                let (val, j) = match cs[v] {
-                    '"' => { let (s, j) = read_delimited(&cs, v, "quote")?; (Val::Quoted(s), j) }
-                    '/' if key != "dir" => { let (s, j) = read_delimited(&cs, v, "regex (missing closing /)")?; (Val::Regex(s), j) }
+                let path_like = key == "path" || key == "file";
+                let regex = if cs[v] == '/' && key != "dir" { whole_regex(&cs, v, path_like)? } else { None };
+                let (val, j) = match (cs[v], regex) {
+                    (_, Some((s, j))) => (Val::Regex(s), j),
+                    ('"', None) => { let (s, j) = read_delimited(&cs, v, "quote")?; (Val::Quoted(s), j) }
                     _ => {
                         let mut j = v;
                         while j < cs.len() && !is_sep(cs[j]) { j += 1; }
@@ -301,7 +319,7 @@ impl Parser {
             Tok::Close => err(p, "unexpected ')'"),
             Tok::And | Tok::Or => err(p, "AND / OR need a term on both sides"),
             Tok::Not | Tok::Minus => unreachable!("unary() consumes negation"),
-            Tok::Term { key, val, vpos } => Ok(Expr::Pred(term(key.as_deref(), val, vpos)?)),
+            Tok::Term { key, val, vpos } => term(key.as_deref(), val, vpos),
         }
     }
 }
@@ -344,19 +362,18 @@ fn path_parts(s: &str) -> Vec<String> {
     s.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".").map(|c| c.to_string()).collect()
 }
 
-fn term(key: Option<&str>, val: Val, vpos: usize) -> Result<Pred, QueryError> {
+fn term(key: Option<&str>, val: Val, vpos: usize) -> Result<Expr, QueryError> {
     let Some(key) = key else {
+        // bare daily / orphan / dangling: the predicate, or the word in a
+        // title (searching "daily" still finds "Daily Review")
         if let Val::Plain(w) = &val {
-            match w.to_lowercase().as_str() {
-                "daily"    => return Ok(Pred::Daily),
-                "orphan"   => return Ok(Pred::Orphan),
-                "dangling" => return Ok(Pred::Dangling),
-                _ => {}
-            }
+            let w = w.to_lowercase();
+            let pred = match w.as_str() { "daily" => Some(Pred::Daily), "orphan" => Some(Pred::Orphan), "dangling" => Some(Pred::Dangling), _ => None };
+            if let Some(p) = pred { return Ok(Expr::Or(vec![Expr::Pred(p), Expr::Pred(Pred::Bare(Text::Sub(w)))])); }
         }
-        return Ok(Pred::Bare(text(val, vpos, false)?));
+        return Ok(Expr::Pred(Pred::Bare(text(val, vpos, false)?)));
     };
-    Ok(match key {
+    Ok(Expr::Pred(match key {
         "tag"   => Pred::Tag(text(val, vpos, true)?),
         "path"  => Pred::Path(text(val, vpos, false)?),
         "file"  => Pred::File(text(val, vpos, false)?),
@@ -387,7 +404,7 @@ fn term(key: Option<&str>, val: Val, vpos: usize) -> Result<Pred, QueryError> {
             Val::Regex(_) => return err(vpos, "'is:' takes daily, orphan or dangling"),
         },
         _ => unreachable!("lexer only emits known keys"),
-    })
+    }))
 }
 
 // ── Evaluation ────────────────────────────────────────────────────────────────
@@ -436,8 +453,10 @@ impl Pred {
             Pred::File(t)  => t.is_match(nd.file.rsplit(['/', '\\']).next().unwrap_or("")),
             Pred::Dir(want) => {
                 // absolute (root included) or relative to the notes root
+                // the root compares in any case: a drive letter (c: / C:) or a
+                // typed ~/Notes against a db that stored ~/notes
                 let want: &[String] = if want.len() >= cx.root.len() && !cx.root.is_empty()
-                    && want.iter().zip(&cx.root).all(|(a, b)| a == b) { &want[cx.root.len()..] } else { want };
+                    && want.iter().zip(&cx.root).all(|(a, b)| eq_ci(a, b)) { &want[cx.root.len()..] } else { want };
                 let have = cx.rel_dirs(&nd.file);
                 want.len() <= have.len() && want.iter().zip(&have).all(|(w, h)| eq_ci(w, h))
             }
@@ -485,6 +504,16 @@ impl Query {
             return err(pos, if p.peek() == Some(&Tok::Close) { "unexpected ')'" } else { "unexpected term" });
         }
         Ok(Query { src: src.to_string(), expr })
+    }
+
+    /// The search box: `parse`, or when the text doesn't parse, the old
+    /// search (title or alias contains the whole text, any case) plus the
+    /// error, to show as a hint. Plain search text never stops working.
+    pub fn search(src: &str) -> (Query, Option<QueryError>) {
+        match Query::parse(src) {
+            Ok(q)  => (q, None),
+            Err(e) => (Query { src: src.to_string(), expr: Expr::Pred(Pred::Bare(Text::Sub(src.to_lowercase()))) }, Some(e)),
+        }
     }
 
     /// Matches every node (empty or blank source).
@@ -643,7 +672,6 @@ mod tests {
         assert_eq!(perr("x AND").pos, 2);
         assert_eq!(perr("x OR OR y").pos, 2);
         assert_eq!(perr("NOT").msg, "NOT needs a term after it");
-        assert_eq!(perr("a -").pos, 2);
         assert_eq!(perr("title:\"open").pos, 6);
         assert_eq!(perr("\"open").msg, "unterminated quote");
         assert_eq!(perr("title:/ab").pos, 6);
@@ -660,6 +688,71 @@ mod tests {
         for s in ["(", ")", "-", "--", "\"", "/", "\\", "tag:\"\\", "((a)", "a))", "NOT (", "OR", "-(", "prop:", "x:\"", "/\\/"] {
             let _ = Query::parse(s);
         }
+    }
+
+    /// Plain search text that used to work still does: a lone '-', a key
+    /// followed by a space, the predicate words, and (through
+    /// `Query::search`) text that doesn't parse at all.
+    #[test]
+    fn plain_text_that_looks_like_syntax_still_searches() {
+        let g = Graph::new(vec![
+            node("a", "Rust - Ownership", "/n/a.org", &[]),
+            node("b", "Path: x marks the spot", "/n/b.org", &[]),
+            node("c", "Daily Review", "/n/c.org", &[]),
+            node("d", "2026-09-01", "/n/daily/2026-09-01.org", &[]),
+            node("e", "Lonely (draft)", "/n/e.org", &[]),
+            node("f", "Orphan Black", "/n/f.org", &[]),
+        ], vec![("a".into(), "b".into()), ("c".into(), "d".into())]);
+        assert_eq!(ids(&g, "rust - ownership"), vec!["a"]);
+        assert_eq!(ids(&g, "Book - Chapter"), Vec::<String>::new());
+        assert_eq!(ids(&g, "-"), vec!["a", "d"], "a lone '-' is a word");
+        assert_eq!(ids(&g, "-(daily)"), vec!["a", "b", "e", "f"], "'-' before '(' still negates");
+        assert_eq!(ids(&g, "Path: x"), vec!["b"], "a key and a space: text");
+        assert_eq!(ids(&g, "tag: x"), Vec::<String>::new());
+        assert!(Query::parse("File: x").is_ok() && Query::parse("Is: x").is_ok());
+        assert_eq!(ids(&g, "daily"), vec!["c", "d"], "the daily note AND the title");
+        assert_eq!(ids(&g, "is:daily"), vec!["d"], "is: is the predicate alone");
+        assert_eq!(ids(&g, "orphan"), vec!["e", "f"]);
+        assert_eq!(Query::parse("Daily").unwrap().first_bare().as_deref(), Some("daily"));
+        // text that doesn't parse: the old whole-text search, and the error
+        for src in ["(draft", "lonely (draft", "\"rust"] {
+            let (q, e) = Query::search(src);
+            assert!(e.is_some(), "{src}");
+            let v  = compute_view(&g, &ViewFilter::default());
+            let cx = EvalCtx::from_view(&g, &v);
+            let hit: Vec<usize> = (0..g.node_list.len()).filter(|&i| q.matches(&cx, i)).collect();
+            assert_eq!(hit.len(), usize::from(src != "\"rust"), "{src}: {hit:?}");
+        }
+        let (q, e) = Query::search("tag:x");
+        assert!(e.is_none() && q.src == "tag:x");
+        // still errors where the text can only be a mistake
+        assert!(Query::parse("tag:").is_err() && Query::parse("tag:(").is_err());
+    }
+
+    /// path: takes a path: a leading '/' is a regex only when the regex is
+    /// the whole value.
+    #[test]
+    fn absolute_paths_in_path_and_file() {
+        let g = fixture();
+        assert_eq!(ids(&g, "path:/n/posts"), vec!["p", "q", "x"], "a substring of the path, like path:posts");
+        assert_eq!(ids(&g, "path:/n/posts/"), vec!["p", "q"]);
+        assert_eq!(ids(&g, "path:/n/posts/first.org"), vec!["p"]);
+        assert_eq!(ids(&g, "path:/tmp"), Vec::<String>::new(), "unterminated: still a path, no error");
+        assert_eq!(ids(&g, "path:/deep/"), vec!["q"], "a whole /regex/ is still one");
+        assert_eq!(ids(&g, "path:/posts/ level:0"), vec!["p", "q", "x"]);
+        assert_eq!(ids(&g, "title:/^post/"), vec!["x"]);
+        assert_eq!(ids(&g, "/n/posts"), Vec::<String>::new(), "bare: a word, not regex + word");
+    }
+
+    /// The notes root in an absolute dir: compares in any case (drive
+    /// letters, a typed ~/Notes).
+    #[test]
+    fn absolute_dir_ignores_case_in_the_root() {
+        let g = Graph::new(vec![node("a", "A", "c:/Users/x/notes/a.org", &[]), node("p", "P", "c:/Users/x/notes/posts/p.org", &[])], vec![]);
+        assert_eq!(ids(&g, "dir:c:/Users/x/notes/posts"), vec!["p"]);
+        assert_eq!(ids(&g, r#"dir:"C:\Users\x\notes\posts""#), vec!["p"]);
+        assert_eq!(ids(&g, "dir:C:/users/X/Notes/Posts"), vec!["p"]);
+        assert_eq!(ids(&g, "dir:C:/Users/x/notes"), vec!["a", "p"]);
     }
 
     #[test]

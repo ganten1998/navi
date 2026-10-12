@@ -13,10 +13,14 @@
 //! ```
 //!
 //! Loading is tolerant, as config.json is: a bad db entry, view, group or
-//! value is dropped (to its default) on its own and the rest is kept; when
-//! anything was dropped, or the file isn't JSON at all, the original is
-//! copied to `views.json.bad` before navi ever writes over it. Saves are
-//! atomic (temp file + rename).
+//! value is dropped (to its default) on its own and the rest is kept; bytes
+//! that aren't UTF-8 are read as U+FFFD. When anything was dropped or
+//! replaced, or the file isn't JSON at all, the original is copied to
+//! `views.json.bad` before navi ever writes over it. A views.json that
+//! exists but can't be read at all (permissions, an I/O error) is never
+//! written over in that session. Saves are atomic (temp file + rename) and
+//! re-read the file first: every db but this session's own keeps what is on
+//! disk, so two navi windows on different dbs don't undo each other.
 //!
 //! Migration: the first time a db has no views, its "Default" view takes the
 //! `dailies` / `orphans` / `links_to_dailies_count` an older config.json
@@ -24,7 +28,7 @@
 //! holding them has been written.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{atomic_write, parse_tolerant, Config, LegacyView};
@@ -101,6 +105,14 @@ impl View {
         }
     }
 
+    /// `G` and the panel's "Show groups": the group display on or off. On,
+    /// in a view with nothing to group, it starts the tag grouper (the old
+    /// tag colouring).
+    pub fn set_colour_groups(&mut self, on: bool) {
+        self.colour_groups = on;
+        if on && self.groups.is_empty() && self.auto == AutoGrouper::None { self.auto = AutoGrouper::Tag; }
+    }
+
     /// The grouping half, with queries compiled.
     pub fn spec(&self) -> GroupSpec {
         GroupSpec {
@@ -154,35 +166,77 @@ struct FileOut<'a> {
     dbs:     &'a BTreeMap<String, DbViews>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ViewStore {
-    pub path: PathBuf,
-    pub dbs:  BTreeMap<String, DbViews>,
+    pub path:   PathBuf,
+    pub dbs:    BTreeMap<String, DbViews>,
+    owned:      BTreeSet<String>, // dbs this session edits; save() takes every other one from disk
+    read_error: Option<String>,   // views.json exists but couldn't be read: never written over
 }
 
 /// The key a db's views are stored under: its canonical path (symlinks and
-/// `..` resolved), or the path as given when it can't be resolved.
+/// `..` resolved). A db that doesn't exist yet resolves its deepest existing
+/// folder and appends the rest, so it keys the same once it exists. Windows'
+/// `\\?\` prefix is dropped. The path as given when nothing resolves.
 pub fn db_key(path: &str) -> String {
-    std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = Path::new(path);
+    loop {
+        if let Ok(mut c) = std::fs::canonicalize(cur) {
+            for r in rest.iter().rev() { c.push(r); }
+            return strip_verbatim(&c.to_string_lossy());
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(up), Some(name)) => { rest.push(name.to_os_string()); cur = up; }
+            _ => return path.to_string(),
+        }
+    }
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\x` → `\\srv\x` (what canonicalize
+/// returns on Windows, versus how every other path there is spelled).
+fn strip_verbatim(p: &str) -> String {
+    if let Some(unc) = p.strip_prefix(r"\\?\UNC\") { return format!(r"\\{unc}"); }
+    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
 }
 
 impl ViewStore {
     pub fn default_path() -> PathBuf { Config::config_dir().join("views.json") }
 
     /// Load `path`; a missing file is an empty store. See the module docs for
-    /// what happens to bad content.
+    /// what happens to bad content and to a file that can't be read.
     pub fn load(path: &Path) -> Self {
-        let mut store = ViewStore { path: path.to_path_buf(), dbs: BTreeMap::new() };
-        let Ok(text) = std::fs::read_to_string(path) else { return store };
+        let mut store = ViewStore { path: path.to_path_buf(), ..ViewStore::default() };
+        match Self::read(path) {
+            Ok(dbs) => store.dbs = dbs.unwrap_or_default(),
+            Err(e)  => {
+                eprintln!("navi: couldn't read {}: {e}; views won't be saved this session", path.display());
+                store.read_error = Some(e.to_string());
+            }
+        }
+        store
+    }
+
+    /// Read and tolerantly parse `path`: None when it doesn't exist; an error
+    /// only when it exists and can't be read. Dropped or non-UTF-8 content
+    /// backs the original bytes up to `views.json.bad` first.
+    fn read(path: &Path) -> std::io::Result<Option<BTreeMap<String, DbViews>>> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let lossy = matches!(text, std::borrow::Cow::Owned(_));
+        if lossy { eprintln!("navi: views.json: not valid UTF-8, read with the bad bytes replaced"); }
         let (dbs, dropped) = Self::parse(&text);
-        if dropped {
+        if dropped || lossy {
             let bad = path.with_extension("json.bad");
-            if std::fs::write(&bad, &text).is_ok() {
+            if std::fs::write(&bad, &bytes).is_ok() {
                 eprintln!("navi: views.json: the original is kept as {}", bad.display());
             }
         }
-        store.dbs = dbs;
-        store
+        Ok(Some(dbs))
     }
 
     /// Parse views.json text. Returns the dbs and whether anything was
@@ -239,12 +293,24 @@ impl ViewStore {
         serde_json::to_string_pretty(&FileOut { version: 1, dbs: &self.dbs }).unwrap_or_else(|_| "{}".into())
     }
 
-    pub fn save(&self) -> std::io::Result<()> { atomic_write(&self.path, &self.to_json()) }
+    /// Write views.json. Every db this session doesn't edit is first taken
+    /// from the file as it is now (another navi may have saved it since we
+    /// loaded); refused when the file couldn't be read at load.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        if let Some(e) = &self.read_error {
+            return Err(std::io::Error::other(format!("not written: it couldn't be read when navi started ({e})")));
+        }
+        for (k, v) in Self::read(&self.path)?.unwrap_or_default() {
+            if !self.owned.contains(&k) { self.dbs.insert(k, v); }
+        }
+        atomic_write(&self.path, &self.to_json())
+    }
 
     /// Make sure `key` has at least one view. A db seen for the first time
     /// gets "Default", seeded from `legacy` (an older config.json's filters).
     /// True when it created one (save, then drop the legacy keys).
     pub fn ensure_db(&mut self, key: &str, legacy: Option<&LegacyView>) -> bool {
+        self.owned.insert(key.to_string());
         let db = self.dbs.entry(key.to_string()).or_default();
         if !db.views.is_empty() { return false; }
         let v = match legacy { Some(l) => View::from_legacy("Default", l), None => View::named("Default") };
@@ -284,6 +350,7 @@ impl ViewStore {
     /// Append `view` (its name made unique) and make it active. Its index.
     pub fn add_view(&mut self, key: &str, mut view: View) -> usize {
         view.name = self.unique_name(key, &view.name, None);
+        self.owned.insert(key.to_string());
         let db = self.dbs.entry(key.to_string()).or_default();
         db.active = view.name.clone();
         db.views.push(view);
@@ -370,7 +437,7 @@ mod tests {
         assert!(!s.set_active("/db/a.db", 7));
         s.save().unwrap();
         let back = ViewStore::load(&path);
-        assert_eq!(back, s);
+        assert_eq!(back.dbs, s.dbs);
         assert_eq!(back.active_index("/db/a.db"), 1);
         assert!(!dir.join("views.json.bad").exists(), "clean file: no backup");
         let text = std::fs::read_to_string(&path).unwrap();
@@ -494,6 +561,20 @@ mod tests {
     }
 
     #[test]
+    fn showing_groups_in_an_empty_view_starts_the_tag_grouper() {
+        let mut v = View::named("V");
+        v.set_colour_groups(true);
+        assert!(v.colour_groups);
+        assert_eq!(v.auto, AutoGrouper::Tag);
+        v.set_colour_groups(false);
+        assert_eq!((v.colour_groups, v.auto), (false, AutoGrouper::Tag), "off keeps the grouper");
+        let mut w = View::named("W");
+        w.groups.push(Group::new("Rust", "tag:rust"));
+        w.set_colour_groups(true);
+        assert_eq!(w.auto, AutoGrouper::None, "manual groups: nothing added");
+    }
+
+    #[test]
     fn spec_and_filter_from_a_view() {
         let mut v = View::named("V");
         v.groups = vec![Group::new("A", "tag:a"), Group::new("B", "tag:(")];
@@ -516,6 +597,84 @@ mod tests {
         let twisted = format!("{}/../{}/org-roam.db", dir.display(), dir.file_name().unwrap().to_string_lossy());
         assert_eq!(db_key(&twisted), db_key(&db.to_string_lossy()));
         assert_eq!(db_key("/no/such/file.db"), "/no/such/file.db");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A db that doesn't exist yet (unsynced, unmounted) keys the same as it
+    /// will once it does, even through a symlinked folder (macOS /var).
+    #[test]
+    fn db_key_is_the_same_before_and_after_the_db_exists() {
+        let dir = tmp("dbkey-missing");
+        let db  = dir.join("sub").join("org-roam.db");
+        let before = db_key(&db.to_string_lossy());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, "").unwrap();
+        assert_eq!(before, db_key(&db.to_string_lossy()));
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\x\db"), r"C:\Users\x\db");
+        assert_eq!(strip_verbatim(r"\\?\UNC\srv\share\db"), r"\\srv\share\db");
+        assert_eq!(strip_verbatim("/Users/x/db"), "/Users/x/db");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes that aren't UTF-8 cost nothing but those bytes, and the original
+    /// is backed up before the file is written again.
+    #[test]
+    fn non_utf8_views_json_is_kept_and_backed_up() {
+        let dir  = tmp("latin1");
+        let path = dir.join("views.json");
+        let mut raw = br#"{ "version": 1, "dbs": { "/other.db": { "active": "Caf"#.to_vec();
+        raw.push(0xE9);
+        raw.extend_from_slice(br#"", "views": [ { "name": "Other", "groups": [ { "name": "G", "query": "tag:x" } ] } ] } } }"#);
+        std::fs::write(&path, &raw).unwrap();
+        let mut s = ViewStore::load(&path);
+        assert_eq!(std::fs::read(dir.join("views.json.bad")).unwrap(), raw, "the original bytes are backed up");
+        assert_eq!(s.views("/other.db").len(), 1, "everything else is kept");
+        assert!(s.ensure_db("/new.db", None));
+        s.save().unwrap();
+        let back = ViewStore::load(&path);
+        assert_eq!(back.views("/other.db")[0].groups[0].query, "tag:x");
+        assert_eq!(back.views("/new.db").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A views.json that exists but can't be read is never written over.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_views_json_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir  = tmp("unreadable");
+        let path = dir.join("views.json");
+        let text = r#"{ "version": 1, "dbs": { "/other.db": { "views": [ { "name": "Mine" } ] } } }"#;
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() { let _ = std::fs::remove_dir_all(&dir); return; } // root reads anything
+        let mut s = ViewStore::load(&path);
+        assert!(s.ensure_db("/new.db", None));
+        assert!(s.save().is_err(), "refused");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two navi windows (different dbs, each with its own snapshot): the
+    /// later save keeps the earlier one's db.
+    #[test]
+    fn concurrent_sessions_keep_each_others_dbs() {
+        let dir  = tmp("concurrent");
+        let path = dir.join("views.json");
+        let mut a = ViewStore::load(&path);
+        let mut b = ViewStore::load(&path);
+        a.ensure_db("/db1", None);
+        a.save().unwrap();
+        b.ensure_db("/db2", None);
+        b.save().unwrap();
+        a.add_view("/db1", View::named("A-new"));
+        a.save().unwrap();
+        b.active_mut("/db2").group_pull = 0.5;
+        b.save().unwrap();
+        let back = ViewStore::load(&path);
+        assert_eq!(back.views("/db1").iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), vec!["Default", "A-new"]);
+        assert_eq!(back.views("/db2")[0].group_pull, 0.5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

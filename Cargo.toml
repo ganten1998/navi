@@ -1,3 +1,8 @@
 [workspace]
 members = ["navi-core", "navi"]
 resolver = "2"
+
+# Profiles only count at the workspace root (cargo ignores a member's).
+[profile.release]
+opt-level = 3
+lto = true

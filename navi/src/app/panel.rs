@@ -7,8 +7,9 @@
 //! views.json is saved (debounced) from one place.
 //!
 //! Input rules (see app.rs): while a panel text field has focus no graph
-//! shortcut fires, and Escape leaves the field first; clicks, drags and
-//! scrolling over the panel (or one of its popups) never reach the graph.
+//! shortcut fires, Escape leaves the field first and Tab cycles nodes;
+//! Escape cancels a pending rename or delete; clicks, drags and scrolling
+//! over the panel (or one of its popups) never reach the graph.
 
 use egui::{Align, Color32, CursorIcon, Layout, Pos2, RichText, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2};
 use navi_core::{
@@ -29,6 +30,7 @@ pub const PANEL_W_MAX: f32 = 600.0;
 pub struct PanelState {
     pub rename:         Option<String>, // the active view's name, being edited
     pub rename_error:   Option<String>,
+    pub rename_focus:   bool,           // give the rename field the keyboard the frame it opens
     pub confirm_delete: bool,           // "Delete view?" asked inline
     pub drag_from:      Option<usize>,  // manual group row being dragged by its handle
 }
@@ -147,11 +149,13 @@ fn views_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut) 
         });
     }
 
+    let focus = std::mem::take(&mut app.panel.rename_focus);
     if let Some(buf) = app.panel.rename.as_mut() {
         let mut commit = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
             let r = ui.add(TextEdit::singleline(buf).desired_width(ui.available_width() - 110.0));
+            if focus { r.request_focus(); } // else typing the name fires graph shortcuts
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { commit = true; }
             if ui.small_button("Rename").clicked() { commit = true; }
             if ui.small_button("Cancel").clicked() { cancel = true; }
@@ -173,6 +177,7 @@ fn views_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut) 
             if ui.button("Rename").clicked() {
                 app.panel.rename = Some(names.get(cur).cloned().unwrap_or_default());
                 app.panel.rename_error = None;
+                app.panel.rename_focus = true;
             }
             let can_delete = names.len() > 1;
             let del = ui.add_enabled(can_delete, egui::Button::new("Delete"));
@@ -238,9 +243,10 @@ fn grip(ui: &mut Ui, t: &Theme, dragging: bool) -> egui::Response {
 
 fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut) {
     let bg = bg_of(t);
-    if ui.checkbox(&mut app.active_view.colour_groups, "Show groups  (G)")
+    let mut shown = app.active_view.colour_groups;
+    if ui.checkbox(&mut shown, "Show groups  (G)")
         .on_hover_text("Group colours, hulls, pull and the legend. Hidden groups hide nodes either way.")
-        .changed() { out.groups = true; }
+        .changed() { app.active_view.set_colour_groups(shown); out.groups = true; } // exactly what G does
 
     // manual groups, highest precedence first
     let n = app.active_view.groups.len();

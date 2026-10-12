@@ -21,6 +21,10 @@
 //! repaints an old one); Component / Community groups keep their slot across
 //! recomputation by greedy max-Jaccard matching against the previous
 //! partition. Ungrouped nodes and orphans use the theme's own node colour.
+//!
+//! Component / Community keys name a member ("community:<node id>", the hub
+//! at first, then inherited through the same matching), never a size rank,
+//! so a hidden cluster stays hidden when sizes reorder or navi restarts.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -174,6 +178,12 @@ impl ColourMemory {
 /// highest first; a matched group inherits the old slot; the rest take the
 /// lowest slots left (cycling past PALETTE_LEN). `prev` = (slot, member ids).
 pub fn match_partition(prev: &[(u8, HashSet<String>)], new: &[Vec<String>]) -> Vec<u8> {
+    match_partition_with(prev, new).into_iter().map(|(s, _)| s).collect()
+}
+
+/// `match_partition`, plus which old group (index into `prev`) each new one
+/// inherited its slot from.
+fn match_partition_with(prev: &[(u8, HashSet<String>)], new: &[Vec<String>]) -> Vec<(u8, Option<usize>)> {
     let mut owner: HashMap<&str, usize> = HashMap::new();
     for (j, (_, m)) in prev.iter().enumerate() { for id in m { owner.insert(id.as_str(), j); } }
     let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
@@ -186,22 +196,25 @@ pub fn match_partition(prev: &[(u8, HashSet<String>)], new: &[Vec<String>]) -> V
         }
     }
     pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut slot: Vec<Option<u8>> = vec![None; new.len()];
+    let mut slot: Vec<Option<(u8, usize)>> = vec![None; new.len()];
     let mut prev_taken = vec![false; prev.len()];
     let mut used: HashSet<u8> = HashSet::new();
     for (_, i, j) in pairs {
         if slot[i].is_some() || prev_taken[j] || used.contains(&prev[j].0) { continue; }
-        slot[i] = Some(prev[j].0);
+        slot[i] = Some((prev[j].0, j));
         prev_taken[j] = true;
         used.insert(prev[j].0);
     }
     let mut next = 0u8;
-    (0..new.len()).map(|i| slot[i].unwrap_or_else(|| {
-        while used.contains(&next) && (used.len() < PALETTE_LEN) { next = (next + 1) % PALETTE_LEN as u8; }
-        let s = if used.len() < PALETTE_LEN { next } else { (i % PALETTE_LEN) as u8 };
-        used.insert(s);
-        s
-    })).collect()
+    (0..new.len()).map(|i| match slot[i] {
+        Some((s, j)) => (s, Some(j)),
+        None => {
+            while used.contains(&next) && (used.len() < PALETTE_LEN) { next = (next + 1) % PALETTE_LEN as u8; }
+            let s = if used.len() < PALETTE_LEN { next } else { (i % PALETTE_LEN) as u8 };
+            used.insert(s);
+            (s, None)
+        }
+    }).collect()
 }
 
 // ── Specs (what views.json stores) ────────────────────────────────────────────
@@ -397,9 +410,10 @@ impl AutoSet {
     }
 }
 
-fn hub_title(g: &Graph, members: &[usize]) -> String {
+/// The best-linked member (ties: the first): what a component or community
+/// is named after, and its identity until a recomputation says otherwise.
+fn hub(g: &Graph, members: &[usize]) -> Option<usize> {
     members.iter().copied().max_by_key(|&i| (g.node_list[i].degree, std::cmp::Reverse(i)))
-        .map(|i| g.node_list[i].title.clone()).unwrap_or_default()
 }
 
 /// Folder groups: the first `depth` directory components below the notes
@@ -448,6 +462,9 @@ fn auto_tag(g: &Graph, eligible: &[bool]) -> AutoSet {
 }
 
 /// One group per partition class with ≥ 2 eligible members, largest first.
+/// Keyed by a MEMBER, never by rank: "<kind>:<hub node id>" (resolve may
+/// keep an older member key, see `partition_keys`), so a hidden component
+/// or community stays the same cluster when sizes reorder.
 fn from_partition(g: &Graph, eligible: &[bool], class: &[Option<usize>], kind: &str) -> AutoSet {
     let n = g.node_list.len();
     let mut by: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -456,8 +473,9 @@ fn from_partition(g: &Graph, eligible: &[bool], class: &[Option<usize>], kind: &
     parts.sort_by_key(|m| (std::cmp::Reverse(m.len()), m[0]));
     let mut set = AutoSet::with_nodes(n);
     for (k, m) in parts.iter().enumerate() {
-        set.keys.push(format!("{kind}:{}", k + 1));
-        set.labels.push(hub_title(g, m));
+        let h = hub(g, m).unwrap_or(m[0]);
+        set.keys.push(format!("{kind}:{}", g.node_list[h].id));
+        set.labels.push(g.node_list[h].title.clone());
         for &i in m { set.members[i].push(k); }
     }
     set
@@ -503,13 +521,28 @@ fn auto_file(g: &Graph, eligible: &[bool]) -> AutoSet {
 
 // ── Community cache (off the UI thread) ───────────────────────────────────────
 
-/// A community job's input: its key, node count and edges.
+/// A community job's input: its key, node count, edges and the node ids its
+/// indices stand for (so an older partition can be read on a newer graph).
 #[derive(Debug, Clone)]
 pub struct CommunityJob {
     pub key:        u64,
     pub n:          usize,
     pub edges:      Vec<(usize, usize)>,
     pub resolution: f64,
+    pub ids:        NodeIds,
+}
+
+type Partition = Arc<Vec<Option<usize>>>;
+type NodeIds   = Arc<Vec<String>>;
+type Landing   = Receiver<Vec<Option<usize>>>; // a worker's partition, when it's done
+
+/// `p` (classes over `from`'s nodes) as classes over `to`'s nodes, by id:
+/// nodes `from` didn't have are in no class.
+fn remap_partition(p: &Partition, from: &NodeIds, to: &NodeIds) -> Partition {
+    if Arc::ptr_eq(from, to) || from == to { return p.clone(); }
+    let class: HashMap<&str, usize> = from.iter().zip(p.iter())
+        .filter_map(|(id, c)| c.map(|c| (id.as_str(), c))).collect();
+    Arc::new(to.iter().map(|id| class.get(id.as_str()).copied()).collect())
 }
 
 impl CommunityJob {
@@ -519,15 +552,24 @@ impl CommunityJob {
     }
 }
 
+/// What `CommunityCache::get` has for a request.
+enum Communities {
+    Fresh(Partition), // computed for exactly this request
+    Stale(Partition), // the last one, read onto this graph by node id, while the new one runs
+    Pending,          // nothing computed yet
+}
+
 /// Latest-wins community computation. Graphs under `sync_below` nodes are
 /// computed inline (a few ms); bigger ones run on a worker thread, at most
 /// one at a time, and a request made while one runs replaces any earlier
-/// queued request (the debounce). Until the new partition lands, the last
-/// one (same node count) keeps showing.
+/// queued request (the debounce); asking again for the running one drops
+/// the queue. Until the new partition lands, the last one keeps showing,
+/// matched to the current nodes by id (a reload that adds a note doesn't
+/// blank or recolour anything).
 pub struct CommunityCache {
     pub sync_below: usize,
-    done:           Option<(u64, Arc<Vec<Option<usize>>>)>,
-    running:        Option<(u64, Receiver<Vec<Option<usize>>>)>,
+    done:           Option<(u64, Partition, NodeIds)>,
+    running:        Option<(u64, NodeIds, Landing)>,
     queued:         Option<CommunityJob>,
 }
 
@@ -538,34 +580,37 @@ impl Default for CommunityCache {
 impl CommunityCache {
     fn spawn(&mut self, job: CommunityJob) {
         let (tx, rx) = channel();
-        let key = job.key;
+        let (key, ids) = (job.key, job.ids.clone());
         std::thread::spawn(move || { let _ = tx.send(job.run()); });
-        self.running = Some((key, rx));
+        self.running = Some((key, ids, rx));
     }
 
-    fn get(&mut self, job: CommunityJob) -> Option<Arc<Vec<Option<usize>>>> {
-        if let Some((k, p)) = &self.done { if *k == job.key { return Some(p.clone()); } }
-        let n = job.n;
-        if n < self.sync_below {
+    fn get(&mut self, job: CommunityJob) -> Communities {
+        if let Some((k, p, _)) = &self.done { if *k == job.key { return Communities::Fresh(p.clone()); } }
+        if job.n < self.sync_below {
             let p = Arc::new(job.run());
-            self.done = Some((job.key, p.clone()));
-            return Some(p);
+            self.done = Some((job.key, p.clone(), job.ids));
+            return Communities::Fresh(p);
         }
+        let ids = job.ids.clone();
         match &self.running {
-            Some((k, _)) if *k == job.key => {}
+            Some((k, ..)) if *k == job.key => self.queued = None, // back to the running request: drop the queue
             Some(_) => self.queued = Some(job),
             None    => self.spawn(job),
         }
-        self.done.as_ref().filter(|(_, p)| p.len() == n).map(|(_, p)| p.clone())
+        match &self.done {
+            Some((_, p, from)) => Communities::Stale(remap_partition(p, from, &ids)),
+            None => Communities::Pending,
+        }
     }
 
     /// Collect a finished job (and start the queued one). True when a new
     /// partition landed: recompute the view.
     pub fn poll(&mut self) -> bool {
-        let Some((key, rx)) = &self.running else { return false };
+        let Some((key, ids, rx)) = &self.running else { return false };
         match rx.try_recv() {
             Ok(p) => {
-                self.done    = Some((*key, Arc::new(p)));
+                self.done    = Some((*key, Arc::new(p), ids.clone()));
                 self.running = None;
                 if let Some(job) = self.queued.take() { self.spawn(job); }
                 true
@@ -586,11 +631,30 @@ fn edges_key(n: usize, edges: &[(usize, usize)], resolution: f64, scope: Communi
 
 // ── Grouping (stateful: colour memory, previous partitions, communities) ──────
 
+/// The last fresh partition of a kind: (slot, member ids) per group, and
+/// each group's key.
+type PrevPartition = (Vec<(u8, HashSet<String>)>, Vec<String>);
+
 #[derive(Default)]
 pub struct Grouping {
     pub memory:    ColourMemory,
-    prev:          HashMap<&'static str, Vec<(u8, HashSet<String>)>>,
+    prev:          HashMap<&'static str, PrevPartition>,
     pub community: CommunityCache,
+}
+
+/// Keys for a new partition's groups ("<kind>:<member id>"), in order of
+/// preference: the key of the old group it inherited its colour from, while
+/// that member is still in it; else a hidden key (`hidden`, sorted) naming
+/// one of its members, so hiding survives a restart; else its hub's
+/// (`fallback`). Every key names a member and classes are disjoint, so keys
+/// are unique.
+fn partition_keys(kind: &str, sets: &[HashSet<String>], inherited: &[Option<&String>], hidden: &[&str], fallback: &[String]) -> Vec<String> {
+    let anchor = |key: &str| key.strip_prefix(kind).and_then(|r| r.strip_prefix(':')).map(str::to_string);
+    sets.iter().enumerate().map(|(k, set)| {
+        let old = inherited[k].filter(|key| anchor(key).is_some_and(|a| set.contains(&a))).cloned();
+        old.or_else(|| hidden.iter().find(|key| anchor(key).is_some_and(|a| set.contains(&a))).map(|key| key.to_string()))
+            .unwrap_or_else(|| fallback[k].clone())
+    }).collect()
 }
 
 impl Grouping {
@@ -636,7 +700,8 @@ impl Grouping {
         }
 
         // the automatic grouper, ranked below
-        let auto = match spec.auto {
+        let mut fresh = true; // false: a stale community partition shows while the new one runs
+        let mut auto = match spec.auto {
             AutoGrouper::None              => AutoSet::with_nodes(n),
             AutoGrouper::Folder { depth }  => auto_folder(g, eligible, depth),
             AutoGrouper::Tag               => auto_tag(g, eligible),
@@ -648,20 +713,31 @@ impl Grouping {
                     CommunityScope::Visible => g.edges.iter().copied().filter(|&(a, b)| eligible[a] && eligible[b]).collect(),
                 };
                 let key = edges_key(n, &edges, resolution, scope);
-                match self.community.get(CommunityJob { key, n, edges, resolution }) {
-                    Some(p) => from_partition(g, eligible, &p, "community"),
-                    None    => AutoSet::with_nodes(n), // first run still computing
+                let ids = Arc::new(g.node_list.iter().map(|nd| nd.id.clone()).collect::<Vec<String>>());
+                match self.community.get(CommunityJob { key, n, edges, resolution, ids }) {
+                    Communities::Fresh(p) => from_partition(g, eligible, &p, "community"),
+                    Communities::Stale(p) => { fresh = false; from_partition(g, eligible, &p, "community") }
+                    Communities::Pending  => { fresh = false; AutoSet::with_nodes(n) } // first run still computing
                 }
             }
         };
         let slots: Vec<u8> = match spec.auto {
             AutoGrouper::Component | AutoGrouper::Community { .. } => {
+                // colours AND keys (so hiding) follow the members, not the size rank
                 let ids: Vec<Vec<String>> = auto.group_members().iter()
                     .map(|m| m.iter().map(|&i| g.node_list[i].id.clone()).collect()).collect();
                 let kind = spec.auto.kind();
-                let prev = self.prev.get(kind).map(|v| v.as_slice()).unwrap_or(&[]);
-                let slots = match_partition(prev, &ids);
-                self.prev.insert(kind, slots.iter().copied().zip(ids.into_iter().map(|v| v.into_iter().collect())).collect());
+                let (prev, prev_keys) = self.prev.get(kind).map_or((&[][..], &[][..]), |(p, k)| (p.as_slice(), k.as_slice()));
+                let matched = match_partition_with(prev, &ids);
+                let sets: Vec<HashSet<String>> = ids.into_iter().map(|v| v.into_iter().collect()).collect();
+                let inherited: Vec<Option<&String>> = matched.iter().map(|&(_, j)| j.and_then(|j| prev_keys.get(j))).collect();
+                let mut hidden: Vec<&str> = spec.auto_hidden.iter().map(String::as_str).collect();
+                hidden.sort_unstable();
+                auto.keys = partition_keys(kind, &sets, &inherited, &hidden, &auto.keys);
+                let slots: Vec<u8> = matched.iter().map(|&(s, _)| s).collect();
+                // only a fresh partition becomes the reference (a stale or
+                // empty stand-in would wipe the colour history)
+                if fresh { self.prev.insert(kind, (slots.iter().copied().zip(sets).collect(), auto.keys.clone())); }
                 slots
             }
             _ => self.memory.assign(&auto.keys),
@@ -1022,6 +1098,145 @@ mod tests {
         assert_eq!(r1.groups[r1.primary[d].unwrap()].colour, r2.groups[r2.primary[d].unwrap()].colour);
     }
 
+    /// Two chains, "a" of `na` nodes and "b" of `nb`, as `/n/<id>.org`.
+    fn chains(na: usize, nb: usize) -> Graph {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for (p, len) in [("a", na), ("b", nb)] {
+            for k in 0..len {
+                let id = format!("{p}{k}");
+                nodes.push(node(&id, &id.to_uppercase(), &format!("/n/{id}.org"), &[]));
+                if k > 0 { edges.push(e(&format!("{p}{}", k - 1), &id)); }
+            }
+        }
+        Graph::new(nodes, edges)
+    }
+
+    fn colour_of(g: &Graph, r: &GroupResolution, s: &str) -> Option<GroupColour> {
+        r.members[id(g, s)].first().map(|&k| r.groups[k].colour)
+    }
+
+    /// Components keep their colour AND their hidden state when a
+    /// recomputation reorders them by size (keys name a member, not a rank).
+    #[test]
+    fn component_colours_and_hiding_follow_members_not_rank() {
+        let mut spec = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut grouping = Grouping::default();
+        let g1 = chains(3, 2);
+        let (_, r1) = grouping.compute(&g1, &ViewFilter::default(), &spec);
+        assert_eq!(r1.groups.len(), 2);
+        let b_key = r1.groups[r1.members[id(&g1, "b0")][0]].key.clone();
+        assert!(b_key.starts_with("component:b"), "{b_key}");
+        let (ca, cb) = (colour_of(&g1, &r1, "a0"), colour_of(&g1, &r1, "b0"));
+        assert_eq!((ca, cb), (Some(GroupColour::Slot(0)), Some(GroupColour::Slot(1))));
+        spec.auto_hidden.insert(b_key.clone());
+        let (v1, _) = grouping.compute(&g1, &ViewFilter::default(), &spec);
+        assert!(v1.visible[id(&g1, "a0")] && !v1.visible[id(&g1, "b0")]);
+
+        // b grows past a: it is listed first now, and keeps its colour and its hiding
+        let g2 = chains(3, 5);
+        let (v2, r2) = grouping.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!(r2.groups[0].members, 5, "b ranks first");
+        assert_eq!((colour_of(&g2, &r2, "a0"), colour_of(&g2, &r2, "b0")), (ca, cb), "colours follow members");
+        assert_eq!(r2.groups[r2.members[id(&g2, "b0")][0]].key, b_key);
+        assert!(v2.visible[id(&g2, "a0")], "a was never hidden");
+        assert!(!v2.visible[id(&g2, "b4")], "b is still the hidden one");
+
+        // a fresh session (the key read back from views.json) hides the same cluster
+        let (v3, _) = Grouping::default().compute(&g2, &ViewFilter::default(), &spec);
+        assert!(v3.visible[id(&g2, "a0")] && !v3.visible[id(&g2, "b0")]);
+    }
+
+    /// The finding's case: hiding dailies shrinks the bigger component below
+    /// the other one; the hidden one stays hidden.
+    #[test]
+    fn hiding_dailies_does_not_move_a_hidden_component() {
+        let g = Graph::new(vec![
+            node("a", "A", "/n/a.org", &[]), node("b", "B", "/n/b.org", &[]),
+            node("d1", "2026-01-01", "/n/daily/d1.org", &[]), node("d2", "2026-01-02", "/n/daily/d2.org", &[]),
+            node("x", "X", "/n/x.org", &[]), node("y", "Y", "/n/y.org", &[]), node("z", "Z", "/n/z.org", &[]),
+        ], vec![e("a", "b"), e("b", "d1"), e("d1", "d2"), e("x", "y"), e("y", "z")]);
+        let mut spec = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut grouping = Grouping::default();
+        let shown = ViewFilter { dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        let (_, r) = grouping.compute(&g, &shown, &spec);
+        spec.auto_hidden.insert(r.groups[r.members[id(&g, "x")][0]].key.clone());
+        let (v, _) = grouping.compute(&g, &shown, &spec);
+        assert!(!v.visible[id(&g, "x")] && v.visible[id(&g, "a")]);
+        let (v, _) = grouping.compute(&g, &ViewFilter { dailies: DailiesMode::Hide, ..shown.clone() }, &spec);
+        assert!(!v.visible[id(&g, "x")], "x y z stay hidden");
+        assert!(v.visible[id(&g, "a")] && v.visible[id(&g, "b")], "a b stay shown");
+    }
+
+    /// Three cliques joined in a ring by single links; `sizes` per clique.
+    fn cliques(sizes: &[usize]) -> Graph {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for (c, &len) in sizes.iter().enumerate() {
+            let p = (b'a' + c as u8) as char;
+            for i in 0..len {
+                nodes.push(node(&format!("{p}{i}"), &format!("{p}{i}"), &format!("/n/{p}{i}.org"), &[]));
+                for j in 0..i { edges.push(e(&format!("{p}{j}"), &format!("{p}{i}"))); }
+            }
+        }
+        for c in 0..sizes.len() {
+            let (p, q) = ((b'a' + c as u8) as char, (b'a' + ((c + 1) % sizes.len()) as u8) as char);
+            edges.push(e(&format!("{p}0"), &format!("{q}1")));
+        }
+        Graph::new(nodes, edges)
+    }
+
+    fn land(grouping: &mut Grouping) {
+        let t = std::time::Instant::now();
+        while !grouping.community.poll() {
+            assert!(t.elapsed().as_secs() < 20, "worker never finished");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Off-thread communities: a reload that changes the node count keeps
+    /// showing the old partition (by node id) and keeps every colour.
+    #[test]
+    fn async_communities_keep_colours_across_a_reload() {
+        let spec = GroupSpec::new(vec![], AutoGrouper::Community { resolution: 1.0, scope: CommunityScope::All });
+        let mut grouping = Grouping::default();
+        grouping.community.sync_below = 0; // force the worker
+        let g1 = cliques(&[6, 5, 4]);
+        grouping.compute(&g1, &ViewFilter::default(), &spec);
+        land(&mut grouping);
+        let (_, r1) = grouping.compute(&g1, &ViewFilter::default(), &spec);
+        assert_eq!(r1.groups.len(), 3);
+        let before: Vec<_> = ["a0", "b0", "c0"].iter().map(|s| colour_of(&g1, &r1, s)).collect();
+
+        // c grows to the largest: n changes, the job runs in the background
+        let g2 = cliques(&[6, 5, 9]);
+        let (_, stale) = grouping.compute(&g2, &ViewFilter::default(), &spec);
+        assert!(grouping.community.pending());
+        assert_eq!(stale.groups.len(), 3, "the old partition keeps showing (no ungrouped flash)");
+        assert_eq!(["a0", "b0", "c0"].iter().map(|s| colour_of(&g2, &stale, s)).collect::<Vec<_>>(), before);
+        assert!(stale.members[id(&g2, "c8")].is_empty(), "a new note waits for the new partition");
+        land(&mut grouping);
+        let (_, r2) = grouping.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!(r2.groups[0].members, 9, "c ranks first now");
+        assert_eq!(["a0", "b0", "c0"].iter().map(|s| colour_of(&g2, &r2, s)).collect::<Vec<_>>(), before);
+    }
+
+    /// Latest wins: going back to the running request drops the queued one.
+    #[test]
+    fn community_queue_drops_a_superseded_request() {
+        let g = cliques(&[6, 5, 4]);
+        let at = |r: f64| GroupSpec::new(vec![], AutoGrouper::Community { resolution: r, scope: CommunityScope::All });
+        let mut grouping = Grouping::default();
+        grouping.community.sync_below = 0;
+        grouping.compute(&g, &ViewFilter::default(), &at(1.0)); // runs
+        grouping.compute(&g, &ViewFilter::default(), &at(4.0)); // queued
+        grouping.compute(&g, &ViewFilter::default(), &at(1.0)); // the running one again
+        land(&mut grouping);
+        assert!(!grouping.community.pending(), "the 4.0 request was dropped, nothing else runs");
+        grouping.compute(&g, &ViewFilter::default(), &at(1.0));
+        assert!(!grouping.community.pending(), "served from the cache");
+    }
+
     #[test]
     fn bad_manual_query_matches_nothing_and_reports() {
         let g = fixture();
@@ -1083,6 +1298,28 @@ mod tests {
         assert!(!s.physics_on);
         s.set_group_pull(vec![vec![a]], f64::NAN); // garbage in: off, no panic
         assert!(!s.group_pull_active());
+    }
+
+    /// Dragging the pull slider (a new strength every frame) shows the pull
+    /// live: it must not restart the force ease each time.
+    #[test]
+    fn changing_the_pull_while_physics_runs_keeps_forces_live() {
+        let g0 = fixture();
+        let (a, d) = (id(&g0, "a"), id(&g0, "d"));
+        let dist = |g: &Graph| { let (p, q) = (&g.node_list[a], &g.node_list[d]); (p.x - q.x).hypot(p.y - q.y) };
+        let warm = || { let mut g = fixture(); g.set_group_pull(vec![vec![a, d]], 0.05); for _ in 0..600 { g.step(1.0 / 60.0); } g.resume_physics(); for _ in 0..240 { g.step(1.0 / 60.0); } g };
+        let (mut once, mut drag) = (warm(), warm());
+        assert!(once.physics_on && drag.physics_on);
+        let start = dist(&once);
+        once.set_group_pull(vec![vec![a, d]], 0.5);
+        for k in 0..120 {
+            drag.set_group_pull(vec![vec![a, d]], 0.3 + 0.2 * k as f64 / 119.0);
+            once.step(1.0 / 60.0);
+            drag.step(1.0 / 60.0);
+        }
+        let (moved_once, moved_drag) = (start - dist(&once), start - dist(&drag));
+        assert!(moved_once > 1.0, "the pull does something: {moved_once:.2}");
+        assert!(moved_drag > 0.5 * moved_once, "drag {moved_drag:.2} vs once {moved_once:.2}");
     }
 
     #[test]

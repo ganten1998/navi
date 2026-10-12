@@ -228,11 +228,14 @@ impl NaviApp {
     /// into the graph (physics/layouts, group pull) and drop interaction
     /// state on hidden nodes. Groups are resolved inside (see groups.rs:
     /// hidden groups filter before orphan classification).
-    fn refresh_view(&mut self) {
+    /// True when the set of visible nodes changed (the caller decides whether
+    /// the layout re-forms around it).
+    fn refresh_view(&mut self) -> bool {
         if self.grouping.community.poll() { self.view_dirty = true; } // a community partition landed
-        if !self.view_dirty { return; }
+        if !self.view_dirty { return false; }
         self.view_dirty = false;
         let (view, groups) = self.grouping.compute(&self.graph, &self.view_filter, &self.group_spec);
+        let changed = view.visible != self.view.visible;
         self.view   = view;
         self.groups = groups;
         self.graph.apply_view(&self.view);
@@ -248,12 +251,17 @@ impl NaviApp {
         self.hovered  = self.hovered.filter(vis);
         if self.node_dragging.is_some_and(|i| !self.graph.is_visible(i)) { self.node_dragging = None; }
         if self.last_click.as_ref().is_some_and(|(i, _)| !self.graph.is_visible(*i)) { self.last_click = None; }
+        changed
     }
 
-    /// Group pull follows the group display (G): off, nothing pulls.
+    /// Group pull follows the group display (G): off, nothing pulls. Column
+    /// and Tree hold their layout: a group change never starts physics there
+    /// (the pull applies once physics runs, P).
     fn apply_group_pull(&mut self) {
         let lists = if self.active_view.colour_groups { self.groups.pull_lists(&self.view.visible) } else { Vec::new() };
+        let asleep = !self.graph.physics_on;
         self.graph.set_group_pull(lists, self.active_view.group_pull);
+        if asleep && self.layout_mode != 0 { self.graph.physics_on = false; }
     }
 
     /// Write the working view back into the store; views.json is saved
@@ -276,12 +284,13 @@ impl NaviApp {
     /// The window is closing (main.rs `exiting`): write any pending edit.
     pub fn shutdown(&mut self) { self.flush_views(true); }
 
-    /// The active view's groups changed (G, Shift+G, a view switch).
+    /// The active view's groups changed (G, Shift+G, the panel). Hiding a
+    /// group is a filter: when nodes came or went, the layout re-forms.
     fn groups_changed(&mut self) {
         self.group_spec = self.active_view.spec();
         self.store_view();
         self.view_dirty = true;
-        self.refresh_view();
+        if self.refresh_view() { self.reform_layout(); }
     }
 
     /// Switch to view `idx` of this db (1-9, [ / ], the panel).
@@ -403,6 +412,12 @@ impl NaviApp {
         self.store_view();
         self.view_dirty = true;
         self.refresh_view();
+        self.reform_layout();
+    }
+
+    /// What's on screen changed: Disk resumes physics, Column / Tree re-run
+    /// in place.
+    fn reform_layout(&mut self) {
         match self.layout_mode {
             1 => { let t = self.graph.positions_column(); self.graph.begin_layout_transition(t, false); }
             2 => { let t = self.graph.positions_tree();   self.graph.begin_layout_transition(t, false); }
@@ -412,14 +427,15 @@ impl NaviApp {
 
     /// Search + local-graph fade mask; rebuilt only when its inputs change.
     /// The search box speaks the query language (query.rs); while the text
-    /// doesn't parse, nothing fades and the status bar shows the error.
+    /// doesn't parse it searches it as plain text, the old way, and the
+    /// status bar shows why.
     fn refresh_faded(&mut self) {
         let key = (self.search_query.clone(), self.local_hops, self.selected, self.view_gen);
         if self.faded_key.as_ref() == Some(&key) { return; }
         let n = self.graph.node_list.len();
-        let parsed = Query::parse(&self.search_query);
-        self.search_error = parsed.as_ref().err().cloned();
-        let query = parsed.ok().filter(|q| !q.is_empty());
+        let (parsed, error) = Query::search(&self.search_query);
+        self.search_error = error;
+        let query = Some(parsed).filter(|q| !q.is_empty());
         let cx = EvalCtx::from_view(&self.graph, &self.view);
         let local = match (self.local_hops, self.selected) {
             (h, Some(sel)) if h > 0 => Some(self.graph.bfs_visible(sel, h)),
@@ -452,7 +468,7 @@ impl NaviApp {
         self.hulls = if on {
             self.groups.member_lists(&self.view.visible).into_iter().zip(&self.groups.groups)
                 .filter(|(m, g)| g.hull && g.visible && !m.is_empty())
-                .map(|(members, g)| HullDraw { colour: rgb(g.colour.rgb(bg)), label: g.label.clone(), members })
+                .map(|(members, g)| HullDraw::new(rgb(g.colour.rgb(bg)), g.label.clone(), members))
                 .collect()
         } else { Vec::new() };
     }
@@ -544,15 +560,8 @@ impl NaviApp {
     /// Enter: jump to the best visible match (a title starting with the
     /// first search word ranks first, then node order).
     fn search_commit(&mut self) {
-        let query = match Query::parse(&self.search_query) {
-            Ok(q) if !q.is_empty() => q,
-            Ok(_) => { self.search_query.clear(); return; }
-            Err(e) => {
-                self.set_msg(format!("Search: {e}"), Duration::from_secs(5));
-                self.search_query.clear();
-                return;
-            }
-        };
+        let (query, _) = Query::search(&self.search_query); // text that doesn't parse: a plain search
+        if query.is_empty() { self.search_query.clear(); return; }
         self.last_search = self.search_query.trim().to_string();
         let lead = query.first_bare().unwrap_or_default();
         let cx = EvalCtx::from_view(&self.graph, &self.view);
@@ -663,7 +672,7 @@ impl NaviApp {
     fn build_status(&self) -> String {
         if self.search_active {
             let tail = match &self.search_error {
-                Some(e) => format!("   {e}"),
+                Some(e) => format!("   {} matching as plain text ({e})   ESC: Cancel  Enter: Jump", self.search_hits),
                 None if self.search_query.trim().is_empty() => "   ESC: Cancel  Enter: Jump".into(),
                 None => format!("   {} matching   ESC: Cancel  Enter: Jump", self.search_hits),
             };
@@ -721,10 +730,21 @@ impl NaviApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        // A panel text field owns the keyboard: no graph shortcut fires. egui
+        // Escape cancels a pending rename / delete in the panel (never quits
+        // past one), whether or not its field has the keyboard.
+        if (self.panel.rename.is_some() || self.panel.confirm_delete) && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.panel.rename = None;
+            self.panel.rename_error = None;
+            self.panel.confirm_delete = false;
+            return;
+        }
+        // A panel TEXT field owns the keyboard: no graph shortcut fires. egui
         // drops focus on Escape before this runs, so focus held LAST frame
-        // counts too: Escape leaves the field and does nothing else.
-        let typing = ctx.wants_keyboard_input() || self.kb_focus_prev;
+        // counts too: Escape leaves the field and does nothing else. Any
+        // other focused widget (a toggle egui's Tab reached) gives the
+        // keyboard back to the graph, so Space can't flip it.
+        let typing = text_field_focused(ctx) || self.kb_focus_prev;
+        if !typing && ctx.wants_keyboard_input() && !self.tab_to_graph { ctx.memory_mut(|m| m.stop_text_input()); }
         let popup  = ctx.memory(|m| m.any_popup_open());
         if typing || popup {
             self.help_visible = false;
@@ -735,6 +755,17 @@ impl NaviApp {
                 self.search_query.clear();
             }
             if popup && !typing && ctx.input(|i| i.key_pressed(Key::Escape)) { ctx.memory_mut(|m| m.close_popup()); }
+            // Tab in a text field still cycles nodes (and leaves the field),
+            // never walks egui's focus onto the panel's toggles
+            let tab = ctx.input(|i| i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. } => Some(modifiers.shift),
+                _ => None,
+            }));
+            if let (true, Some(back)) = (typing && !popup, tab) {
+                self.tab_cycle(back);
+                self.tab_to_graph = true;
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("navi-graph-tab")));
+            }
             return;
         }
 
@@ -790,9 +821,7 @@ impl NaviApp {
                             }
                             Key::G => {
                                 let v = &mut self.active_view;
-                                v.colour_groups = !v.colour_groups;
-                                // first G with nothing to group: the old tag colouring
-                                if v.colour_groups && v.groups.is_empty() && v.auto == AutoGrouper::None { v.auto = AutoGrouper::Tag; }
+                                v.set_colour_groups(!v.colour_groups); // nothing to group: the old tag colouring
                                 let msg = if v.colour_groups { format!("Groups  On  ·  {}", v.auto.label()) } else { "Groups  Off".into() };
                                 self.popup = Some((msg, self.now_secs));
                                 self.groups_changed();
@@ -846,23 +875,7 @@ impl NaviApp {
                             }
                             Key::Tab => {
                                 self.tab_to_graph = true; // see below the event loop
-                                // Visible nodes only, in node order
-                                let vis = &self.graph.vis_idx;
-                                if !vis.is_empty() {
-                                    let n   = vis.len();
-                                    let cur = self.selected.and_then(|s| vis.iter().position(|&i| i == s));
-                                    let k = match (cur, i.modifiers.shift) {
-                                        (Some(k), false) => (k + 1) % n,
-                                        (Some(k), true)  => (k + n - 1) % n,
-                                        (None, false)    => 0,
-                                        (None, true)     => n - 1,
-                                    };
-                                    let idx = vis[k];
-                                    self.selected = Some(idx);
-                                    let title = self.graph.node_list[idx].title.clone();
-                                    let t = if title.chars().count() > 28 { title.chars().take(28).collect::<String>() + "…" } else { title };
-                                    self.popup = Some((t, self.now_secs));
-                                }
+                                self.tab_cycle(i.modifiers.shift);
                             }
                             Key::Enter | Key::Space => {
                                 if let Some(nid) = self.selected {
@@ -889,6 +902,25 @@ impl NaviApp {
         // this pass; update() lets go of it once the panel is drawn. (Not
         // inside ctx.input above: that holds the context's lock.)
         if self.tab_to_graph { ctx.memory_mut(|m| m.request_focus(egui::Id::new("navi-graph-tab"))); }
+    }
+
+    /// Tab / Shift+Tab: select the next / previous visible node, in node order.
+    fn tab_cycle(&mut self, back: bool) {
+        let vis = &self.graph.vis_idx;
+        if vis.is_empty() { return; }
+        let n   = vis.len();
+        let cur = self.selected.and_then(|s| vis.iter().position(|&i| i == s));
+        let k = match (cur, back) {
+            (Some(k), false) => (k + 1) % n,
+            (Some(k), true)  => (k + n - 1) % n,
+            (None, false)    => 0,
+            (None, true)     => n - 1,
+        };
+        let idx = vis[k];
+        self.selected = Some(idx);
+        let title = self.graph.node_list[idx].title.clone();
+        let t = if title.chars().count() > 28 { title.chars().take(28).collect::<String>() + "…" } else { title };
+        self.popup = Some((t, self.now_secs));
     }
 
     /// Is `pos` over the side panel or one of egui's popups (colour picker,
@@ -1294,8 +1326,9 @@ impl NaviApp {
         let help_target = if self.help_visible { 1.0f32 } else { 0.0 };
         self.help_anim += (help_target - self.help_anim) * (10.0 * dt).min(1.0);
 
-        // ── View (recomputed only when the filter or graph changed) ───────────
-        self.refresh_view();
+        // ── View (recomputed only when the filter or graph changed; a landed
+        //    community partition can hide or show a hidden community) ─────────
+        if self.refresh_view() { self.reform_layout(); }
 
         // ── Input (all mutations before painter borrows) ───────────────────────
         self.handle_keyboard(ctx);
@@ -1334,13 +1367,13 @@ impl NaviApp {
         //    its edits apply now, so the graph below already shows them ──
         let out = panel::show(self, ctx);
         self.apply_panel(out);
-        self.refresh_view();
+        if self.refresh_view() { self.reform_layout(); }
         self.refresh_faded();
         self.refresh_hov_adj();
         self.refresh_colours();
         // the dummy focus that kept Tab on the graph has done its job
         if std::mem::take(&mut self.tab_to_graph) { ctx.memory_mut(|m| m.stop_text_input()); }
-        self.kb_focus_prev = ctx.wants_keyboard_input();
+        self.kb_focus_prev = text_field_focused(ctx);
         self.flush_views(false);
 
         egui::CentralPanel::default()
@@ -1471,6 +1504,13 @@ impl NaviApp {
     }
 }
 
+
+/// A text field (TextEdit, or a DragValue being typed into) has the keyboard.
+/// egui's `wants_keyboard_input` is true for ANY focused widget, a toggle
+/// that Tab reached too; only a text field should silence the shortcuts.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused()).is_some_and(|id| egui::widgets::text_edit::TextEditState::load(ctx, id).is_some())
+}
 
 fn unix_now() -> f64 {
     std::time::SystemTime::now()

@@ -50,19 +50,31 @@ All notable changes to Navi are documented here.
 - **Stable group colours**, readable on every theme: manual groups store
   theirs, folder/tag/file groups keep a remembered palette slot per name
   (a new tag never repaints an old one), and components/communities keep
-  theirs across recomputation by overlap matching. Ungrouped nodes and
-  orphans keep the theme's node colour.
+  theirs across recomputation by overlap matching (also while a large
+  graph's communities recompute in the background, where the previous
+  partition keeps showing). Hiding a component or community stays with
+  that cluster: it's keyed by one of its notes, not its size rank.
+  Ungrouped nodes and orphans keep the theme's node colour.
 - **Query language** for the search box and group queries: `tag:`, `dir:`,
   `path:`, `file:`, `title:` (text or `/regex/`), `alias:`, `level:`,
   `degree:`, `prop:KEY=VAL`, `daily`, `orphan`, `dangling`, `AND` / `OR` /
   `NOT` / `-`, parentheses and quoted phrases. Plain words still search
-  titles and aliases. A query that doesn't parse shows its error and column
-  in the status bar; while typing, the status bar counts matches.
+  titles and aliases, and so does text that only looks like syntax
+  (`Rust - Ownership`, `Path: x`; bare `daily` also finds "Daily Review",
+  `is:daily` is the predicate alone). Search text that doesn't parse
+  (`(draft`) is matched as plain text with the error and its column in the
+  status bar; a group query that doesn't parse matches nothing and shows
+  why. `path:` takes absolute paths, and an absolute `dir:` ignores the
+  case of the notes root (`C:` / `c:`). While typing, the status bar counts
+  matches.
 - **Views**: named sets of groups and filters per db in
   `~/.config/navi/views.json`; `1` to `9` and `[` / `]` switch between them,
   and the last one used is remembered. Loading keeps everything that
-  parses (a bad entry is dropped alone, and the original file is copied to
-  `views.json.bad` first); saves are atomic.
+  parses (a bad entry is dropped alone, bytes that aren't UTF-8 are
+  replaced, and the original file is copied to `views.json.bad` first); a
+  views.json that can't be read at all is never written over. Saves are
+  atomic and keep what another navi window saved for another db. A db that
+  doesn't exist yet keys the same as it will once it does.
 - `Shift-G` cycles the automatic grouper; a legend (top left) lists the
   groups with how many of their nodes are on screen while groups are shown.
 
@@ -95,6 +107,16 @@ All notable changes to Navi are documented here.
   is written. `config.json` is now saved atomically too.
 - Group pull is weak by default (`group_pull: 0.1`) so links between groups
   stay readable; it pauses like the rest of the physics once things settle.
+  Changing it while physics runs shows at once, and in the Column and Tree
+  layouts a group change never starts physics. Hiding or showing a group
+  re-forms the layout, as the dailies and orphan filters do.
+- macOS: needs macOS 14 or later (the frame pacer's display link is a
+  macOS 14 API; on older systems the app would quit at launch). The
+  release zip is named after its architecture (`Navi-<version>-arm64.zip`),
+  carries no Dropbox or Finder metadata, and is built with LTO (the release
+  profile now sits at the workspace root, where cargo reads it). The
+  Linux/Windows packaging script uses the same build directory, so it can't
+  package an old binary.
 - `views.json` is written shortly after the last edit (typing a query
   doesn't write once per key) and again on exit; every write is atomic.
 

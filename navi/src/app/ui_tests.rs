@@ -240,3 +240,135 @@ fn an_idle_panel_lets_the_app_idle() {
     h.app.last_active_at = Instant::now() - h.app.idle_grace - Duration::from_millis(500);
     assert!(h.app.needs_full_speed(), "an animation started near input may finish");
 }
+
+/// Rename puts the keyboard in its field (typing doesn't fire shortcuts),
+/// and Escape cancels a rename or a delete prompt instead of quitting.
+#[test]
+fn rename_takes_the_keyboard_and_escape_cancels() {
+    let mut h = Harness::new("rename", false);
+    h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+    h.app.panel.rename = Some("Default".into()); // what the Rename button does
+    h.app.panel.rename_focus = true;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(text_field_focused(&h.ctx), "the rename field has the keyboard");
+    h.key(Key::O, Modifiers::NONE, Some("o"));
+    assert_eq!(h.app.view_filter.orphans, OrphansMode::Show, "O typed, not cycled");
+    assert!(h.app.panel.rename.as_deref().is_some_and(|b| b.contains('o')), "{:?}", h.app.panel.rename);
+    h.key(Key::Escape, Modifiers::NONE, None);
+    assert!(h.app.panel.rename.is_none() && !h.app.quit_requested, "Escape cancels the rename");
+    // unfocused (clicked away) rename and the delete prompt: Escape cancels, never quits
+    h.app.panel.rename = Some("Default".into());
+    h.frame(vec![]);
+    h.key(Key::Escape, Modifiers::NONE, None);
+    assert!(h.app.panel.rename.is_none() && !h.app.quit_requested);
+    h.app.panel.confirm_delete = true;
+    h.frame(vec![]);
+    h.key(Key::Escape, Modifiers::NONE, None);
+    assert!(!h.app.panel.confirm_delete && !h.app.quit_requested);
+    assert_eq!(h.app.views.views("k")[0].name, "Default");
+}
+
+/// Tab in a panel text field cycles nodes and leaves the field; it never
+/// walks egui's focus onto a toggle (where graph keys would die and Space
+/// would flip it).
+#[test]
+fn tab_in_a_text_field_goes_back_to_the_graph() {
+    let mut h = Harness::new("tabfield", true);
+    h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+    h.click(h.first_text_field());
+    assert!(text_field_focused(&h.ctx));
+    h.key(Key::Tab, Modifiers::NONE, None);
+    assert_eq!(h.app.selected, Some(0), "Tab cycled nodes");
+    h.key(Key::Tab, Modifiers::NONE, None);
+    assert_eq!(h.app.selected, Some(1));
+    assert!(!h.ctx.wants_keyboard_input(), "no panel widget holds the keyboard");
+    h.key(Key::D, Modifiers::NONE, Some("d"));
+    assert_eq!(h.app.view_filter.dailies, DailiesMode::Hide, "graph keys work");
+    assert!(h.app.active_view.groups[0].visible);
+}
+
+fn settle(h: &mut Harness) {
+    for k in 0..6000 {
+        if !h.app.graph.is_layout_animating() && !h.app.graph.physics_on { break; }
+        h.app.graph.step(1.0 / 60.0);
+        if k % 20 == 0 { h.frame(vec![]); }
+    }
+    h.frame(vec![]);
+    assert!(!h.app.graph.is_layout_animating() && !h.app.graph.physics_on, "never settled");
+}
+
+/// Column / Tree hold their layout: turning on groups that pull doesn't
+/// start force-directed physics there.
+#[test]
+fn group_changes_keep_the_tree_layout_still() {
+    let mut h = Harness::new("treepull", false);
+    let mut g = Group::new("ABG", "Alpha OR Beta OR Gamma");
+    g.pull = true;
+    h.app.active_view.groups.push(g);
+    h.app.active_view.group_pull = 0.5;
+    h.app.groups_changed();
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    assert_eq!(h.app.layout_mode, 2);
+    settle(&mut h);
+    h.key(Key::G, Modifiers::NONE, Some("g"));
+    assert!(h.app.active_view.colour_groups && h.app.graph.group_pull_active());
+    assert!(!h.app.graph.physics_on, "the tree stays put");
+    // in Disk the pull does wake physics
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    settle(&mut h);
+    h.app.active_view.group_pull = 0.3;
+    h.app.apply_group_pull();
+    assert!(h.app.graph.physics_on);
+}
+
+/// Hiding a group is a filter: the layout re-forms like it does for D / O.
+#[test]
+fn hiding_a_group_reforms_the_layout() {
+    let mut h = Harness::new("hidegroup", false);
+    h.app.active_view.groups.push(Group::new("G", "title:gamma"));
+    h.app.groups_changed();
+    settle(&mut h);
+    h.app.active_view.groups[0].visible = false;
+    h.app.groups_changed();
+    assert!(!h.app.graph.is_visible(2), "Gamma hidden");
+    assert!(h.app.graph.physics_on, "Disk: physics resumes around the hole");
+    // Tree: the layout re-runs for what's left
+    h.app.active_view.groups[0].visible = true;
+    h.app.groups_changed();
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    settle(&mut h);
+    h.app.active_view.groups[0].visible = false;
+    h.app.groups_changed();
+    assert!(h.app.graph.is_layout_animating(), "Tree re-runs");
+    // a group change that hides nothing moves nothing
+    settle(&mut h);
+    h.app.active_view.groups[0].hull = true;
+    h.app.groups_changed();
+    assert!(!h.app.graph.is_layout_animating() && !h.app.graph.physics_on);
+}
+
+/// Search text that doesn't parse still searches, as plain text.
+#[test]
+fn search_falls_back_to_plain_text() {
+    let mut h = Harness::new("search", false);
+    h.key(Key::Slash, Modifiers::NONE, Some("/"));
+    for (k, c) in [(Key::OpenBracket, "("), (Key::A, "a"), (Key::L, "l")] { h.key(k, Modifiers::NONE, Some(c)); }
+    assert_eq!(h.app.search_query, "(al");
+    assert!(h.app.search_error.is_some());
+    assert_eq!(h.app.search_hits, 0, "no title contains \"(al\"");
+    h.app.search_query = "Beta - x".into();
+    h.frame(vec![]);
+    assert!(h.app.search_error.is_none(), "a lone '-' is a word");
+    h.app.search_query = "(beta".into();
+    h.frame(vec![]);
+    assert!(h.app.search_error.is_some());
+    h.app.graph.node_list[1].title = "(Beta) notes".into();
+    h.app.view_gen = h.app.view_gen.wrapping_add(1);
+    h.frame(vec![]);
+    assert_eq!(h.app.search_hits, 1, "matched as plain text");
+    h.key(Key::Enter, Modifiers::NONE, None);
+    assert_eq!(h.app.selected, Some(1), "Enter jumps to it");
+}

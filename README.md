@@ -20,7 +20,7 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 All from the [Releases](https://codeberg.org/ganten1998/navi/releases) page:
 
-- **macOS (Apple Silicon)**: `Navi-<version>-host.zip`: unzip, double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it; right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
+- **macOS (Apple Silicon, macOS 14 or later)**: `Navi-<version>-arm64.zip`: unzip, double-click `Navi.app`. The app is signed with a Developer ID and notarized by Apple, so it opens like any downloaded app.
 - **Linux**: `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL, present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).
 - **Windows (x64)**: `navi-<version>-windows-x86_64.zip`: unzip, run `navi.exe`.
 
@@ -36,7 +36,7 @@ cargo build --release
 To build the `.app` bundle yourself:
 
 ```bash
-./scripts/build-macos.sh                # arm64 (host)
+./scripts/build-macos.sh                # this Mac's arch (Navi-<version>-arm64.zip on Apple Silicon)
 ARCH=universal ./scripts/build-macos.sh # arm64 + x86_64 universal
 open dist/Navi.app
 ```
@@ -157,7 +157,7 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | `name` | Shown when switching (`View  Writing  (2/2)`) and in the status bar when a db has more than one view. |
 | `groups` | Manual groups, highest precedence first: `name`, `query` (see below), `colour` (`"#rrggbb"`; left out, a palette colour from the name), `visible` (default `true`), `pull`, `hull` (default `false`). A group whose query doesn't parse matches nothing and the status bar says why. |
 | `auto` | The automatic grouper: `{"kind": "none" \| "folder" \| "tag" \| "component" \| "community" \| "file"}`, plus `depth` (folder, default 1), `resolution` and `scope` (community). |
-| `auto_hidden` | Keys of hidden automatic groups, like `"tag:draft"` or `"folder:archive"`. |
+| `auto_hidden` | Keys of hidden automatic groups, like `"tag:draft"` or `"folder:archive"`. A component or community is keyed by one of its notes (`"community:<node id>"`), so it stays hidden when the clusters are recomputed and reordered. |
 | `auto_pull`, `auto_hull` | Pull / hull for every automatic group. |
 | `colour_groups` | The `G` toggle. |
 | `dailies` | `"show"` or `"hide"` (`D` toggles and saves it). Read back in any case; `"shown"` / `"hidden"` work too. |
@@ -180,7 +180,7 @@ Loading is forgiving: a bad view, group or value is dropped on its own and every
 | Physics | Group pull strength (0.1 drifts, 0.5 clusters tightly) and pause / resume. |
 | Inspector | The selected node: title, file relative to the notes root, tags, aliases, links in view and in the db, orphan status (no links at all, isolated by filters, or daily-only), its dangling links, and every group it's in with the one that gives its colour marked. "Open in Emacs". |
 
-While a text field in the panel has the keyboard, no shortcut fires (typing `d` in a query doesn't hide dailies); `Escape` leaves the field first, and a click on the graph does too. `Tab` keeps cycling nodes. Clicks, drags and scrolling over the panel stay in the panel: they never pan, select or zoom the graph, and the graph is laid out, fitted and hit-tested in the space left of it.
+While a text field in the panel has the keyboard, no shortcut fires (typing `d` in a query doesn't hide dailies); `Escape` leaves the field first, and a click on the graph does too. `Tab` keeps cycling nodes (and leaves the field). Rename puts the keyboard in the name field; `Escape` cancels a rename or a delete prompt. Clicks, drags and scrolling over the panel stay in the panel: they never pan, select or zoom the graph, and the graph is laid out, fitted and hit-tested in the space left of it.
 
 ### Query language
 
@@ -194,18 +194,19 @@ The search box (`/`) and group queries share one language. Terms next to each ot
 | `alias:TEXT` | An alias |
 | `tag:X`, `tag:/re/` | Has tag `X` (whole tag, any case) |
 | `dir:PATH` | File is in folder `PATH` or below it, relative to the notes root (`dir:posts` matches `posts/a.org` and `posts/2026/b.org`, never `postscript/`). Whole folder names only; `/` or `\`; an absolute path works too. |
-| `path:TEXT` | Full file path contains `TEXT` |
+| `path:TEXT` | Full file path contains `TEXT` (an absolute path works: `path:/Users/me/notes/posts`) |
 | `file:TEXT` | File name contains `TEXT` |
 | `level:0`, `level:>0` | File nodes / heading nodes (`=N`, `>N`, `<N`, `>=N`, `<=N`) |
 | `degree:>N` | More than N links (`=N`, `<N`, ...; counts every real link in the db) |
 | `prop:KEY`, `prop:KEY=VALUE` | Has an org property (any case; `prop:"KEY=two words"`) |
-| `daily` | A daily note |
-| `orphan` | No link to anything in the current view (for groups: before group hiding) |
-| `dangling` | Has a link to a missing node or an unresolved `[[title]]` |
+| `is:daily` | A daily note |
+| `is:orphan` | No link to anything in the current view (for groups: before group hiding) |
+| `is:dangling` | Has a link to a missing node or an unresolved `[[title]]` |
+| `daily`, `orphan`, `dangling` | The same, or a title or alias containing the word (so searching `daily` still finds "Daily Review") |
 | `A OR B`, `A AND B`, `NOT A`, `-A` | Either, both, neither. `AND` binds tighter than `OR`; `-` works on a term or a group: `-(tag:a OR tag:b)` |
 | `( ... )` | Grouping |
 
-Operators are upper case (`and`, `or`, `not` are ordinary words). A word whose part before `:` isn't one of the keys above is plain text, so `http://x` or `Rust:` search titles as before. While the query doesn't parse, nothing fades and the status bar shows the problem and its column (`col 8: OR needs a term on both sides`). `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
+Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text stays plain text: a word whose part before `:` isn't one of the keys above (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone `-` (`Rust - Ownership`). A value starting with `/` is a regex only when the closing `/` ends it, so `path:/n/posts` is a path and `title:/^draft/` a regex. While the search doesn't parse (`(draft`), it matches as plain text, the old way, and the status bar says why and where (`col 1: missing ')' for this '('`); a group query that doesn't parse matches nothing and shows the error. `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
 
 ---
 

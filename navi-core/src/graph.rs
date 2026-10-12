@@ -256,7 +256,10 @@ impl Graph {
     /// group sum to zero, so they add no net motion and the auto-pause still
     /// settles. A node in several pulling groups splits the strength between
     /// them. Hidden members are skipped every step (frozen, as ever); the
-    /// clamp is untouched. Changing the pull eases forces back in.
+    /// clamp is untouched. Changing the pull wakes paused physics (forces
+    /// ease back in); while physics already runs it just carries on, so
+    /// dragging the strength or typing a query shows the pull live instead
+    /// of restarting the ease on every change.
     pub fn set_group_pull(&mut self, groups: Vec<Vec<usize>>, strength: f64) {
         let strength = if strength.is_finite() { strength.clamp(0.0, MAX_PULL) } else { 0.0 };
         let groups: Vec<Vec<usize>> = groups.into_iter()
@@ -267,7 +270,9 @@ impl Graph {
         let changed = groups != self.pull_groups || strength != self.pull_strength;
         self.pull_groups   = groups;
         self.pull_strength = strength;
-        if changed && !(was_off && off(self)) { self.resume_physics(); }
+        if changed && !(was_off && off(self)) {
+            if self.physics_on { self.settle_frames = 0; } else { self.resume_physics(); }
+        }
     }
 
     pub fn group_pull_active(&self) -> bool { self.pull_strength > 0.0 && !self.pull_groups.is_empty() }
