@@ -1,6 +1,5 @@
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2, epaint::FontId};
 use navi_core::{Graph, Node};
-use std::collections::HashSet;
 use crate::theme::Theme;
 
 // ── Age ───────────────────────────────────────────────────────────────────────
@@ -75,11 +74,10 @@ pub struct GraphPainter<'a> {
     pub theme:      Theme,
     pub pan:        Vec2,
     pub zoom:       f32,
-    pub hovered:    Option<&'a str>,
-    pub selected:   Option<&'a str>,
-    pub hidden:     &'a HashSet<String>,
-    pub faded:      &'a HashSet<String>,
-    pub hov_adj:    HashSet<String>,
+    pub hovered:    Option<usize>,   // node indices; visibility comes from graph.visible
+    pub selected:   Option<usize>,
+    pub faded:      &'a [bool],      // search / local-graph fade, per node
+    pub hov_adj:    &'a [bool],      // hovered node + its visible neighbours, per node
     pub show_tags:  bool,
     pub show_age:   bool,
     pub now_secs:   f64,
@@ -151,11 +149,12 @@ impl<'a> GraphPainter<'a> {
         let t        = &self.theme;
         let edge_col = Color32::from_rgba_unmultiplied(t.edge.r(),    t.edge.g(),    t.edge.b(),    190);
         let edge_hi  = Color32::from_rgba_unmultiplied(t.edge_hi.r(), t.edge_hi.g(), t.edge_hi.b(), 255);
-        for &(si, di) in &self.graph.edges {
+        let fade = |i: usize| self.faded.get(i).copied().unwrap_or(false);
+        let adj  = |i: usize| self.hov_adj.get(i).copied().unwrap_or(false);
+        for &(si, di) in &self.graph.vis_edges {
             let a = &self.graph.node_list[si];
             let b = &self.graph.node_list[di];
-            if self.hidden.contains(&a.id) || self.hidden.contains(&b.id) { continue; }
-            if self.faded.contains(&a.id)  && self.faded.contains(&b.id)  { continue; }
+            if fade(si) && fade(di) { continue; }
             let p1 = self.w2s(a.x, a.y);
             let p2 = self.w2s(b.x, b.y);
             let r  = self.graph_rect;
@@ -163,16 +162,15 @@ impl<'a> GraphPainter<'a> {
             if p1.x > r.right()+10.0  && p2.x > r.right()+10.0  { continue; }
             if p1.y < r.top()-10.0    && p2.y < r.top()-10.0    { continue; }
             if p1.y > r.bottom()+10.0 && p2.y > r.bottom()+10.0 { continue; }
-            let hov = self.hov_adj.contains(&a.id) && self.hov_adj.contains(&b.id)
-                || (Some(a.id.as_str()) == self.hovered && self.hov_adj.contains(&b.id))
-                || (Some(b.id.as_str()) == self.hovered && self.hov_adj.contains(&a.id));
+            // hov_adj holds the hovered node itself, so this covers edges at it too
+            let hov = adj(si) && adj(di);
             painter.line_segment([p1, p2], Stroke::new(1.0, if hov { edge_hi } else { edge_col }));
         }
     }
 
     pub fn paint_nodes(&self, painter: &Painter) {
-        for (node_idx, nd) in self.graph.node_list.iter().enumerate() {
-            if self.hidden.contains(&nd.id) { continue; }
+        for &node_idx in &self.graph.vis_idx {
+            let nd = &self.graph.node_list[node_idx];
             let sc = self.w2s(nd.x, nd.y);
             // Visual breathing — purely cosmetic screen-space offset, actual world
             // position (used for hit detection, edges, physics) is unchanged.
@@ -187,10 +185,10 @@ impl<'a> GraphPainter<'a> {
             if sc.x + pr*4.0 < r.left()-10.0   || sc.x - pr*4.0 > r.right()+10.0  { continue; }
             if sc.y + pr*4.0 < r.top()-10.0    || sc.y - pr*4.0 > r.bottom()+10.0 { continue; }
 
-            let is_sel  = Some(nd.id.as_str()) == self.selected;
-            let is_hov  = Some(nd.id.as_str()) == self.hovered;
-            let is_fade = self.faded.contains(&nd.id)
-                || (self.hovered.is_some() && !self.hov_adj.contains(&nd.id) && !is_sel && !is_hov);
+            let is_sel  = Some(node_idx) == self.selected;
+            let is_hov  = Some(node_idx) == self.hovered;
+            let is_fade = self.faded.get(node_idx).copied().unwrap_or(false)
+                || (self.hovered.is_some() && !self.hov_adj.get(node_idx).copied().unwrap_or(false) && !is_sel && !is_hov);
 
             let (rim_col, body_col) = self.node_colors(nd, is_sel, is_hov, is_fade);
 
@@ -257,8 +255,8 @@ impl<'a> GraphPainter<'a> {
         let max_chars: usize = if self.zoom < 0.55 { 8 }
                                else if self.zoom < 1.0 { 15 }
                                else { usize::MAX };
-        for (node_idx, nd) in self.graph.node_list.iter().enumerate() {
-            if self.hidden.contains(&nd.id) { continue; }
+        for &node_idx in &self.graph.vis_idx {
+            let nd = &self.graph.node_list[node_idx];
             let sc = self.w2s(nd.x, nd.y);
             // Match breathing offset so label stays under its node
             let phase = node_idx as f32 * 1.618033988749895_f32;
@@ -270,9 +268,9 @@ impl<'a> GraphPainter<'a> {
             let r = self.graph_rect;
             if dsc.x < r.left()-200.0 || dsc.x > r.right()+200.0 { continue; }
             if dsc.y < r.top()-20.0   || dsc.y > r.bottom()+20.0  { continue; }
-            let is_hi   = Some(nd.id.as_str()) == self.hovered || Some(nd.id.as_str()) == self.selected;
-            let is_fade = self.faded.contains(&nd.id)
-                || (self.hovered.is_some() && !self.hov_adj.contains(&nd.id) && !is_hi);
+            let is_hi   = Some(node_idx) == self.hovered || Some(node_idx) == self.selected;
+            let is_fade = self.faded.get(node_idx).copied().unwrap_or(false)
+                || (self.hovered.is_some() && !self.hov_adj.get(node_idx).copied().unwrap_or(false) && !is_hi);
             let alpha = if is_fade { (alpha_base / 5).max(0) } else { alpha_base };
             if alpha < 5 { continue; }
             let base_col = if is_hi { t.label_hov } else { t.label };
@@ -288,15 +286,15 @@ impl<'a> GraphPainter<'a> {
         }
     }
 
-    pub fn node_at(&self, sx: f32, sy: f32) -> Option<&str> {
+    pub fn node_at(&self, sx: f32, sy: f32) -> Option<usize> {
         let mut best_d = f32::INFINITY;
-        let mut best: Option<&str> = None;
-        for nd in &self.graph.node_list {
-            if self.hidden.contains(&nd.id) { continue; }
+        let mut best: Option<usize> = None;
+        for &i in &self.graph.vis_idx {
+            let nd = &self.graph.node_list[i];
             let sc = self.w2s(nd.x, nd.y);
             let d  = (sc - Pos2::new(sx, sy)).length();
             let hr = (nd.radius * self.zoom).max(9.0);
-            if d <= hr && d < best_d { best_d = d; best = Some(&nd.id); }
+            if d <= hr && d < best_d { best_d = d; best = Some(i); }
         }
         best
     }

@@ -64,7 +64,11 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
   "emacsclient": "/opt/homebrew/bin/emacsclient",
   "server_name": "server",
   "show_fps": true,
-  "borderless": false
+  "borderless": false,
+  "dailies": "show",
+  "orphans": "show",
+  "dailies_dirs": ["daily", "dailies", "journal", "journals"],
+  "links_to_dailies_count": true
 }
 ```
 
@@ -75,6 +79,10 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
 | `server_name` | Emacs server name (default `server`). |
 | `show_fps` | Show FPS counter in the status bar (`F` toggles at runtime). |
 | `borderless` | Draw the window without titlebar/decorations (default `false`). Leave off under tiling WMs — a decorated, resizable window is what lets AeroSpace / i3 tile it. |
+| `dailies` | Daily-notes filter, `"show"` or `"hide"` (`D` toggles and saves it). Read back in any case, and `"shown"` / `"hidden"` work too. A bad value in any key falls back to that key's default alone; the rest of the file is kept. |
+| `orphans` | Orphan filter, `"show"`, `"hide"` or `"only"` (`O` cycles and saves it). An orphan is a node with no link to another node *in the current view*. Hiding dailies can isolate a note whose only links were to dailies; the status bar counts those as "isolated by filters". Read back like `dailies`, plus `"only"`. |
+| `dailies_dirs` | Directory names that mark a daily note (default `daily`, `dailies`, `journal`, `journals`). Matched as whole path components, case-insensitively, `/` or `\` separated, so `dailyish/` and `daily.org` don't match. Only directories *below* the notes root (the deepest folder every note shares) count, so notes kept under e.g. `~/Journal/roam/` aren't all dailies. A `YYYY-MM-DD` title is always a daily. |
+| `links_to_dailies_count` | When `false`, a link to a daily doesn't save a note from being an orphan: a note linked only to dailies counts as one. A daily stays connected if it links to a connected note (otherwise it's an orphan too, so `O` never leaves one drawn alone). The status bar calls these "daily-only". Only matters while dailies are shown; default `true`. |
 
 The legacy config path `~/.config/org-roam-graph/config.json` is also read; the next save writes to the new path.
 
@@ -118,13 +126,13 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | Scroll / trackpad | Zoom toward cursor |
 | Click node | Select — highlights connections |
 | Double-click node | Open in Emacs |
-| `Tab` / `Shift-Tab` | Cycle nodes |
+| `Tab` / `Shift-Tab` | Cycle visible nodes |
 | `Enter` / `Space` | Open selected node |
 | `T` | Cycle colour theme |
 | `G` | Toggle tag colouring |
 | `A` | Toggle age / weathering heatmap |
-| `D` | Toggle daily-notes filter |
-| `O` | Toggle orphan filter |
+| `D` | Show / hide daily notes (saved to config) |
+| `O` | Cycle orphans: shown → hidden → only (saved to config) |
 | `L` | Cycle local-graph mode (1 → 2 → 3 hops → off) |
 | `V` | Cycle layout algorithm |
 | `/` | Search by title or alias |
@@ -132,7 +140,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | `F` | Toggle FPS counter |
 | `P` | Pause / resume physics |
 | `R` | Reset view |
-| `H` | Hold to show controls panel |
+| `H` | Hold to show controls panel (plus orphan and unresolved-link counts) |
 | `Q` / `Escape` | Quit |
 
 ---
@@ -165,11 +173,14 @@ Result on a 240 Hz display (macOS): 4.17 ms average frame interval, worst-case 5
 
 ```
 Cargo.toml                Workspace root
-navi-core/                Pure-Rust library: config, org-roam DB loader, graph + physics
+navi-core/                Pure-Rust library: config, org-roam DB loader, view pipeline, graph + physics
   src/lib.rs
   src/config.rs           Config load/save, db detection, path expansion
+  src/db.rs               org-roam.db loader: link typing, dedupe, dangling links, containment
   src/emacs.rs            emacsclient + socket discovery
-  src/graph.rs            Force-directed physics, layouts, hidden/faded sets
+  src/view.rs             Dailies / orphan filters → visible nodes + edges, orphan counts
+  src/graph.rs            Force-directed physics + layouts over the visible subset
+  tests/probe_real_db.rs  #[ignore]d read-only probe of your real org-roam.db
 navi/                     Binary: UI, rendering, event loop
   src/main.rs             winit + glutin event loop, paint pacer
   src/app.rs              egui app: input, layout, status bar

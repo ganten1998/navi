@@ -83,11 +83,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // double-clicking the binary would just silently do nothing. Open with an
     // empty graph and say where we looked; `W` re-reads the db once it exists.
     let (graph, startup_error) = match load_graph(&db_path) {
-        Ok((raw_nodes, raw_edges)) => {
-            let n_nodes = raw_nodes.len();
-            let n_edges = raw_edges.len();
-            eprintln!("navi: loaded {n_nodes} nodes, {n_edges} edges");
-            (Graph::new(raw_nodes, raw_edges), None)
+        Ok(data) => {
+            let s = data.stats;
+            eprintln!(
+                "navi: loaded {} nodes, {} edges ({} duplicate, {} self-links dropped; {} unresolved links)",
+                data.nodes.len(), data.edges.len(), s.duplicates, s.self_links, data.dangling.len(),
+            );
+            // laid out for the saved filter: one layout, of what's on screen
+            (Graph::from_data_with_view(data, &cfg.view_filter()), None)
         }
         Err(e) => {
             eprintln!("navi: failed to load {db_path}: {e}");

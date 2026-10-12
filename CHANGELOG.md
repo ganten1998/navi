@@ -2,6 +2,58 @@
 
 All notable changes to Navi are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Orphan filter is tri-state**: `O` cycles shown → hidden → only. The
+  status bar shows the mode and counts when it isn't "shown"
+  (`Orphans:Hidden 13 (2 isolated by filters)`); the `H` panel shows orphan
+  and unresolved-link counts. With `links_to_dailies_count: false`, notes
+  linked only to dailies count as orphans ("daily-only"); a daily linked to
+  a connected note does not.
+- **Filters persist**: the dailies and orphan modes are saved to
+  `config.json` (`dailies`, `orphans`), plus two new keys: `dailies_dirs`
+  (which directory names mark a daily) and `links_to_dailies_count`. Old
+  config files load unchanged, the modes read back in any case (and as
+  `"shown"` / `"hidden"`), and a bad value resets only its own key instead
+  of the whole file.
+- **Unresolved links are counted**: `fuzzy` links and `id:` links to a
+  missing node used to vanish silently; they're now kept as dangling links
+  and counted (help panel, startup log).
+- Heading nodes record their file node (containment, for future grouping;
+  not drawn, not a link).
+
+### Fixed
+
+- **Orphans are judged on what's on screen**: hiding dailies left notes
+  whose only links were to dailies sitting isolated, and the orphan filter
+  didn't hide them. Orphan status now comes from the filtered graph, and
+  layouts place the same nodes in their orphan cluster.
+- **Duplicate and self-links**: the same link written twice (or both ways)
+  counted twice toward degree, node size and spring force, and was drawn
+  twice; a self-link added 2 to degree. Links are now deduped as unordered
+  pairs and self-links dropped.
+- **Hidden nodes left the simulation**: they still repelled visible nodes,
+  stretched "reset view" and layout fits, and Tab could select them. Physics,
+  every layout, fitting, Tab cycling and hit-testing now use visible nodes
+  only; hidden nodes stay frozen where they were, and a selection that gets
+  hidden is cleared.
+- **Disconnected islands** in Column/Tree/Disk/Radial layouts are laid out as
+  their own components beside the main one instead of being lumped in with
+  the orphans. Disk/Radial pack them in rings just outside the main
+  component (radius grows with √islands), and the physics clamp is sized
+  from the placement, so islands aren't squashed against the rim and a
+  filter key never snaps nodes inward.
+- Daily detection matches `dailies_dirs` as whole directory components only
+  (never the file name or a substring), on `/` and `\` paths alike, and only
+  below the notes root, so a `Journal` folder above the notes isn't a match.
+- Node order is deterministic (file, position, id); it used to follow
+  HashMap order, so layouts differed run to run. Filters and search/local
+  fading are computed only when they change instead of every frame. A saved
+  filter no longer lays the graph out twice at startup, and an empty graph
+  (no db yet) lets the app idle instead of rendering at full rate.
+
 ## [1.0.0] — 2026-05-20, re-released 2026-07-28
 
 The 2026-07-28 re-release (same version, tag recut) makes the app fully
