@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build Navi.app for macOS and package it as Navi-<version>-<arch>.zip.
+# Build Navi.app for macOS, sign it with Developer ID, notarize + staple it,
+# and package the stapled app as Navi-<version>-<arch>.zip.
 #
 # Usage:
 #   scripts/build-macos.sh                # release build, host arch
@@ -7,8 +8,22 @@
 #
 # Output: dist/Navi.app  and  dist/Navi-<version>-<arch>.zip
 #
-# Requirements: Rust toolchain (rustup), Xcode CLT for codesign / ditto.
-# For ARCH=universal: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+# Environment:
+#   NAVI_SIGN_ID              codesign identity (default: first installed
+#                             "Developer ID Application"; none = ad-hoc, no
+#                             notarization, NOT release-grade)
+#   NAVI_NOTARY_PROFILE       notarytool keychain profile (default: tangent-notary)
+#   NAVI_ALLOW_UNNOTARIZED=1  package a signed app even when notarization failed
+#   CARGO_TARGET_DIR          respected; defaults to ~/.cache/navi-target when
+#                             the repo lives in Dropbox (it breaks cargo linking)
+#   MACOSX_DEPLOYMENT_TARGET  default 11.0; also written as LSMinimumSystemVersion
+#
+# Requirements: Rust toolchain (rustup), Xcode CLT for codesign / ditto /
+# notarytool / stapler. For ARCH=universal:
+#   rustup target add x86_64-apple-darwin aarch64-apple-darwin
+# The notary profile is created once with:
+#   xcrun notarytool store-credentials tangent-notary \
+#     --apple-id <id> --team-id 6GFLLR9599 --password <app-specific-password>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,26 +31,50 @@ cd "$ROOT"
 
 ARCH="${ARCH:-host}"
 VERSION="$(grep '^version' navi/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+# Info.plist version keys take at most three period-separated integers; a
+# semver suffix ("1.1.0-beta.1", "1.1.0+ci7") is invalid there and notarization
+# rejects it. File names keep the full string, the bundle gets the numeric core.
+VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 APP="dist/Navi.app"
 ZIP="dist/Navi-${VERSION}-${ARCH}.zip"
+BUNDLE_ID="com.navi.graph"   # unchanged since 1.0: renaming it orphans prefs and TCC grants
 
-echo "==> Navi $VERSION  arch=$ARCH"
+# One deployment target for both slices and the plist. rustc's defaults differ
+# per arch (aarch64 11.0, x86_64 10.12), which would leave a universal binary
+# disagreeing with its own LSMinimumSystemVersion.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+
+# Cargo cannot link build scripts inside Dropbox ("Operation not permitted").
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  case "$ROOT" in
+    *Dropbox*) export CARGO_TARGET_DIR="$HOME/.cache/navi-target" ;;
+    *)         export CARGO_TARGET_DIR="$ROOT/target" ;;
+  esac
+fi
+TARGET_DIR="$CARGO_TARGET_DIR"
+
+echo "==> Navi $VERSION (bundle $VERSION_NUM)  arch=$ARCH  target-dir=$TARGET_DIR"
 
 # ── Build ────────────────────────────────────────────────────────────────────
 case "$ARCH" in
   host)
     cargo build --release -p navi
-    BIN="target/release/navi"
+    BIN="$TARGET_DIR/release/navi"
     ;;
   universal)
+    # Homebrew rust shadows rustup's cargo on PATH and has no x86_64 std, so
+    # the cross target would not resolve; prefer the rustup toolchain here.
+    TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
+    [ -n "$TOOLCHAIN_BIN" ] || TOOLCHAIN_BIN="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin"
+    [ ! -d "$TOOLCHAIN_BIN" ] || export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
     rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
     cargo build --release -p navi --target x86_64-apple-darwin
     cargo build --release -p navi --target aarch64-apple-darwin
-    mkdir -p target/universal/release
-    BIN="target/universal/release/navi"
+    mkdir -p "$TARGET_DIR/universal/release"
+    BIN="$TARGET_DIR/universal/release/navi"
     lipo -create -output "$BIN" \
-      target/x86_64-apple-darwin/release/navi \
-      target/aarch64-apple-darwin/release/navi
+      "$TARGET_DIR/x86_64-apple-darwin/release/navi" \
+      "$TARGET_DIR/aarch64-apple-darwin/release/navi"
     ;;
   *)
     echo "unknown ARCH=$ARCH (expected host|universal)" >&2
@@ -45,14 +84,16 @@ esac
 
 # ── Bundle ───────────────────────────────────────────────────────────────────
 echo "==> Assembling $APP"
-rm -rf "$APP" "$ZIP"
+# The bundle only: the old zip stays until a new one is ready to replace it,
+# so a failed sign or notarization does not destroy the last good artifact.
+rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/navi"
 chmod +x "$APP/Contents/MacOS/navi"
 strip -x "$APP/Contents/MacOS/navi" 2>/dev/null || true
 
-# Icon — build a fully canonical .icns from the highest-resolution variant
+# Icon: build a fully canonical .icns from the highest-resolution variant
 # we can find, scaling with `sips` to every size Finder/Dock expects. We
 # write the icns binary ourselves rather than going through iconutil because
 # `iconutil` on recent macOS has been reported to reject perfectly valid
@@ -127,31 +168,144 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>       <string>navi</string>
     <key>CFBundleIconFile</key>         <string>AppIcon</string>
     <key>CFBundleIconName</key>         <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>       <string>com.navi.graph</string>
+    <key>CFBundleIdentifier</key>       <string>${BUNDLE_ID}</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundlePackageType</key>      <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
-    <key>CFBundleVersion</key>          <string>${VERSION}</string>
-    <key>LSMinimumSystemVersion</key>   <string>11.0</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION_NUM}</string>
+    <key>CFBundleVersion</key>          <string>${VERSION_NUM}</string>
+    <key>LSMinimumSystemVersion</key>   <string>${MACOSX_DEPLOYMENT_TARGET}</string>
     <key>NSHighResolutionCapable</key>  <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
     <key>NSPrincipalClass</key>         <string>NSApplication</string>
 </dict>
 </plist>
 PLIST
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-# Ad-hoc codesign so macOS lets the user open it (still flagged by Gatekeeper
-# on first launch — instruct users to right-click → Open or `xattr -cr Navi.app`).
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || \
-  echo "warn: codesign failed (continuing, app will trip Gatekeeper)"
+# ── Sign ─────────────────────────────────────────────────────────────────────
+# Developer ID + hardened runtime + notarization is what lets a downloaded app
+# open without the "Open Anyway" trip through System Settings (the right-click
+# Open bypass is gone as of macOS 15).
+#
+# No entitlements file, on purpose. The hardened runtime would need one for
+# JIT / unsigned executable memory, DYLD env vars, third-party dylibs, or
+# camera / mic / Apple Events; Navi uses none of them. It links only system
+# frameworks (OpenGL through glutin's CGL path is Apple-signed, so library
+# validation passes), and spawning emacsclient is plain fork/exec of another
+# signed-or-not binary, which the hardened runtime does not restrict: the child
+# runs under its own signature, and the server socket it talks to is ordinary
+# file-system IPC (no sandbox here).
+SIGN_ID="${NAVI_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+  | grep "Developer ID Application" | head -1 \
+  | sed -E 's/.*\) ([0-9A-F]{40}) ".*/\1/' || true)}"
+
+# Dropbox and Finder stamp xattrs that codesign rejects as "detritus".
+xattr -cr "$APP" 2>/dev/null || true
+
+# Inside-out rather than --deep (deprecated: it applies the outer bundle's
+# options to nested code). There is one Mach-O today; sign it, then the bundle.
+if [ -n "$SIGN_ID" ]; then
+  echo "==> Signing with Developer ID ($SIGN_ID)"
+  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/MacOS/navi"
+  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP"
+  SIGNED_RELEASE=1
+else
+  echo ""
+  echo "!! WARNING: no Developer ID Application certificate found; signing AD-HOC."
+  echo "!! This build is NOT notarized and WILL be refused by Gatekeeper on any"
+  echo "!! other Mac. Do not publish it."
+  echo ""
+  # Hardened runtime here too, so a local build behaves like the release one.
+  codesign --force --options runtime -s - "$APP/Contents/MacOS/navi"
+  codesign --force --options runtime -s - "$APP"
+  SIGNED_RELEASE=0
+fi
+codesign --verify --strict --deep --verbose=2 "$APP"
+# The hardened runtime is a notarization prerequisite; read it back out of the
+# signature rather than trusting the flag. (No `grep -q`: it exits at the first
+# match and SIGPIPEs codesign under pipefail.)
+case "$(codesign -d -v "$APP" 2>&1 || true)" in
+  *"flags="*"runtime)"*) ;;   # "(runtime)" or "(adhoc,runtime)"
+  *) echo "error: signed bundle does not have the hardened runtime" >&2; exit 1 ;;
+esac
+
+# ── Notarize ─────────────────────────────────────────────────────────────────
+# Notarize and staple BEFORE packaging, so the zip carries the stapled app and
+# a first launch works offline. Stapling the zip itself does nothing.
+NOTARY_PROFILE="${NAVI_NOTARY_PROFILE:-tangent-notary}"
+NOTARIZED=0
+if [ "$SIGNED_RELEASE" = 1 ]; then
+  NOTARY_DIR="$(mktemp -d)"
+  NOTARY_LOG="$NOTARY_DIR/submit.log"
+  SUBMISSION_ID=""
+  echo "==> Notarizing with profile '$NOTARY_PROFILE' (waits on Apple; typically 1-5 minutes)"
+  ditto -c -k --sequesterRsrc --keepParent "$APP" "$NOTARY_DIR/Navi.zip"
+  # `submit --wait` can exit 0 on an Invalid verdict, so the exit status is not
+  # the answer: read the id and status out of the log, then let the stapler and
+  # spctl below have the final word.
+  xcrun notarytool submit "$NOTARY_DIR/Navi.zip" \
+    --keychain-profile "$NOTARY_PROFILE" --wait 2>&1 | tee "$NOTARY_LOG" || true
+  SUBMISSION_ID="$(awk '$1 == "id:" { print $2; exit }' "$NOTARY_LOG")"
+  STATUS="$(awk '$1 == "status:" { s = $2 } END { print s }' "$NOTARY_LOG")"
+  if [ "$STATUS" = "Accepted" ]; then
+    echo "==> Stapling"
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    NOTARIZED=1
+  else
+    echo "" >&2
+    echo "!! NOTARIZATION FAILED (status: ${STATUS:-none})" >&2
+    if [ -n "$SUBMISSION_ID" ]; then
+      echo "   submission id: $SUBMISSION_ID" >&2
+      echo "   inspect with:  xcrun notarytool log $SUBMISSION_ID --keychain-profile $NOTARY_PROFILE" >&2
+    else
+      echo "   No submission was made; check the profile with:" >&2
+      echo "     xcrun notarytool history --keychain-profile $NOTARY_PROFILE" >&2
+    fi
+    echo "" >&2
+  fi
+  rm -rf "$NOTARY_DIR"
+fi
+
+# ── The gate ─────────────────────────────────────────────────────────────────
+# A signed but unnotarized zip looks exactly like a release and is refused on
+# every Mac but this one, so it is not emitted unless asked for by name.
+# dist/Navi.app stays built either way. Ad-hoc builds already said what they are.
+if [ "$SIGNED_RELEASE" = 1 ] && [ "$NOTARIZED" = 0 ]; then
+  if [ "${NAVI_ALLOW_UNNOTARIZED:-0}" = 1 ]; then
+    echo "warn: PACKAGING AN UNNOTARIZED RELEASE (NAVI_ALLOW_UNNOTARIZED=1)."
+    echo "      This zip will be refused by Gatekeeper on every Mac but this one."
+  else
+    echo "!! Refusing to package. dist/Navi.app is built but not notarized." >&2
+    echo "   To package anyway: NAVI_ALLOW_UNNOTARIZED=1 $0" >&2
+    exit 1
+  fi
+fi
+
+# What a downloader's Mac will actually decide.
+if [ "$NOTARIZED" = 1 ]; then
+  SPCTL="$(spctl -a -t exec -vv "$APP" 2>&1 || true)"
+  echo "$SPCTL" | sed 's/^/    /'
+  case "$SPCTL" in
+    *accepted*"source=Notarized Developer ID"*) ;;
+    *) echo "error: Gatekeeper does not accept the stapled app as Notarized Developer ID" >&2
+       exit 1 ;;
+  esac
+fi
 
 # Bump bundle mtime so Icon Services notices a fresh app and reloads the icon.
+# (Touching does not change the signature: mtimes are not sealed.)
 touch "$APP" "$APP/Contents/Info.plist"
 
 # ── Package ──────────────────────────────────────────────────────────────────
 echo "==> Packaging $ZIP"
+rm -f "$ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 du -h "$BIN" "$APP/Contents/MacOS/navi" "$ZIP" | sed 's/^/    /'
-echo "==> Done. Open with:  open $APP"
+if [ "$NOTARIZED" = 1 ]; then
+  echo "==> Done: signed, notarized and stapled."
+else
+  echo "==> Done (NOT notarized)."
+fi
 echo "==> Upload to release:  gh release upload v${VERSION} $ZIP --clobber"
