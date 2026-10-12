@@ -4,12 +4,14 @@
 #   scripts/build-cross.sh          # builds + packages everything into dist/
 #
 # Requirements (all via Homebrew/cargo):
-#   brew install zig
+#   brew install zig llvm
 #   cargo install cargo-zigbuild cargo-xwin
 #   rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc
 #
 # Note: if Homebrew's rust is also installed, its cargo/rustc shadow rustup's
 # on PATH and cross-target std libs won't be found; hence the PATH prefix.
+# cargo-xwin builds bundled C (sqlite) with llvm-lib / clang-cl / lld-link,
+# which Homebrew's llvm keeps off PATH (keg-only); the script finds the keg.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,6 +22,17 @@ GLIBC="2.32"   # floor for released Linux binaries
 
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
+
+# llvm-lib for the Windows step: PATH, else Homebrew's llvm keg (llvm, or the
+# newest versioned llvm@N). Checked up front so a missing LLVM fails here,
+# not after both Linux tarballs.
+if ! command -v llvm-lib >/dev/null 2>&1; then
+  BREW="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+  for keg in "$BREW/opt/llvm" $(ls -d "$BREW"/opt/llvm@* 2>/dev/null | sort -t@ -k2 -n -r); do
+    if [ -x "$keg/bin/llvm-lib" ]; then export PATH="$keg/bin:$PATH"; break; fi
+  done
+fi
+command -v llvm-lib >/dev/null 2>&1 || { echo "error: llvm-lib not found (brew install llvm); the Windows build needs it" >&2; exit 1; }
 
 # Cargo cannot link build scripts inside Dropbox ("Operation not permitted"),
 # so the build goes where build-macos.sh puts it; the artifacts are copied
@@ -43,7 +56,9 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   cp "$TARGET_DIR/${target}/release/navi" "$stage/"
   cp assets/navi.desktop "$stage/"
   cp assets/icon.png "$stage/"
-  tar -C dist -czf "${stage}.tar.gz" "navi-${VERSION}-linux-${arch}"
+  # dist/ is in Dropbox: the files carry com.apple.provenance and Dropbox
+  # xattrs, which macOS tar would ship as AppleDouble ._ files
+  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C dist -czf "${stage}.tar.gz" "navi-${VERSION}-linux-${arch}"
   rm -rf "$stage"
   echo "==> ${stage}.tar.gz"
 }

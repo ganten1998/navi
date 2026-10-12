@@ -6,11 +6,13 @@
 #   scripts/build-macos.sh                # release build, host arch (named by it: arm64)
 #   ARCH=universal scripts/build-macos.sh # arm64 + x86_64 universal binary
 #
-# Output: dist/Navi.app  and  dist/Navi-<version>-<arch>.zip
+# Output: dist/Navi.app  and  dist/Navi-<version>-<arch>.zip (an ad-hoc build
+# is packaged as Navi-<version>-<arch>-adhoc.zip, never under the release name)
 #
 # Environment:
-#   NAVI_SIGN_ID              codesign identity (default: first installed
-#                             "Developer ID Application"; none = ad-hoc, no
+#   NAVI_SIGN_ID              codesign identity (unset: the first installed
+#                             "Developer ID Application"; none found, or set
+#                             but empty (NAVI_SIGN_ID=): ad-hoc, no
 #                             notarization, NOT release-grade)
 #   NAVI_NOTARY_PROFILE       notarytool keychain profile (default: tangent-notary)
 #   NAVI_ALLOW_UNNOTARIZED=1  package a signed app even when notarization failed
@@ -91,7 +93,8 @@ esac
 # ── Bundle ───────────────────────────────────────────────────────────────────
 echo "==> Assembling $APP"
 # The bundle only: the old zip stays until a new one is ready to replace it,
-# so a failed sign or notarization does not destroy the last good artifact.
+# so a failed sign or notarization does not destroy the last good artifact
+# (an ad-hoc build never replaces it either: it is packaged under -adhoc).
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -201,7 +204,8 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 # signed-or-not binary, which the hardened runtime does not restrict: the child
 # runs under its own signature, and the server socket it talks to is ordinary
 # file-system IPC (no sandbox here).
-SIGN_ID="${NAVI_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+# `-` not `:-`: NAVI_SIGN_ID= (set, empty) asks for an ad-hoc build on purpose.
+SIGN_ID="${NAVI_SIGN_ID-$(security find-identity -v -p codesigning 2>/dev/null \
   | grep "Developer ID Application" | head -1 \
   | sed -E 's/.*\) ([0-9A-F]{40}) ".*/\1/' || true)}"
 
@@ -225,6 +229,8 @@ else
   codesign --force --options runtime -s - "$APP/Contents/MacOS/navi"
   codesign --force --options runtime -s - "$APP"
   SIGNED_RELEASE=0
+  # never under the release name: the last notarized zip stays where it is
+  ZIP="dist/Navi-${VERSION}-${ZIP_ARCH}-adhoc.zip"
 fi
 codesign --verify --strict --deep --verbose=2 "$APP"
 # The hardened runtime is a notarization prerequisite; read it back out of the
@@ -329,7 +335,8 @@ ditto -c -k --norsrc --noextattr --keepParent "$APP" "$ZIP"
 du -h "$BIN" "$APP/Contents/MacOS/navi" "$ZIP" | sed 's/^/    /'
 if [ "$NOTARIZED" = 1 ]; then
   echo "==> Done: signed, notarized and stapled."
+  # Releases live on Codeberg (the only remote); there is no gh equivalent.
+  echo "==> Attach $ZIP to the v${VERSION} release: https://codeberg.org/ganten1998/navi/releases"
 else
-  echo "==> Done (NOT notarized)."
+  echo "==> Done (NOT notarized). Not for release: Gatekeeper refuses it on other Macs."
 fi
-echo "==> Upload to release:  gh release upload v${VERSION} $ZIP --clobber"

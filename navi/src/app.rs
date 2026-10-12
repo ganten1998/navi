@@ -132,7 +132,7 @@ impl NaviApp {
         let view_filter = active_view.filter(&cfg.dailies_dirs);
         let group_spec  = active_view.spec();
         let mut grouping = Grouping::default();
-        grouping.memory.slots = active_view.auto_colours.clone();
+        grouping.memory.slots = views.auto_colours(&db_key); // the db's, shared by its views
         let mut app = NaviApp {
             graph,
             cfg,
@@ -240,11 +240,8 @@ impl NaviApp {
         self.groups = groups;
         self.graph.apply_view(&self.view);
         self.apply_group_pull();
-        // keyed auto-group colours persist with the view (only when new keys appeared)
-        if self.grouping.memory.slots != self.active_view.auto_colours {
-            self.active_view.auto_colours = self.grouping.memory.slots.clone();
-            self.store_view();
-        }
+        // auto-group colours persist with the db (only when new keys appeared)
+        if self.views.set_auto_colours(&self.db_key, &self.grouping.memory.slots) { self.views_dirty_at = Some(Instant::now()); }
         self.view_gen = self.view_gen.wrapping_add(1);
         let vis = |i: &usize| self.graph.is_visible(*i);
         self.selected = self.selected.filter(vis);
@@ -272,12 +269,18 @@ impl NaviApp {
     }
 
     /// Save views.json when an edit is pending and has settled (or now, `force`).
+    /// A failed save stays pending: a passing failure (a file another program
+    /// holds, a full disk) is retried after SAVE_DEBOUNCE and at exit. Only a
+    /// views.json that couldn't be read at startup is never retried.
     fn flush_views(&mut self, force: bool) {
         let Some(at) = self.views_dirty_at else { return };
         if !force && at.elapsed() < SAVE_DEBOUNCE { return; }
-        self.views_dirty_at = None;
-        if let Err(e) = self.views.save() {
-            self.set_msg(format!("Couldn't save {}: {e}", self.views.path.display()), Duration::from_secs(6));
+        match self.views.save() {
+            Ok(()) => self.views_dirty_at = None,
+            Err(e) => {
+                self.views_dirty_at = self.views.writable().then(Instant::now);
+                self.set_msg(format!("Couldn't save {}: {e}", self.views.path.display()), Duration::from_secs(6));
+            }
         }
     }
 
@@ -293,11 +296,27 @@ impl NaviApp {
         if self.refresh_view() { self.reform_layout(); }
     }
 
+    /// The active view's groups changed in colour or name only (a colour
+    /// drag, typing a name): patched in place, since neither moves a node
+    /// into or out of a group; no re-resolve per drag step or key.
+    fn group_restyled(&mut self) {
+        self.group_spec.manual = self.active_view.groups.clone(); // queries unchanged: `compiled` still matches
+        if !self.groups.restyle_manual(&self.active_view.groups) { return self.groups_changed(); }
+        self.colours_key = None; // node colours, hull colours and labels
+        self.store_view();
+    }
+
     /// Switch to view `idx` of this db (1-9, [ / ], the panel).
     fn switch_view(&mut self, idx: usize) {
         let n = self.views.views(&self.db_key).len();
         if idx >= n {
             self.popup = Some((format!("No view {}  ({n} saved)", idx + 1), self.now_secs));
+            return;
+        }
+        // its own key (or [ / ] with one view): say where you are, reload
+        // nothing (no layout re-run, physics stays asleep, prompts stay)
+        if idx == self.views.active_index(&self.db_key) {
+            self.popup = Some((format!("View  {}  ({}/{n})", self.active_view.name, idx + 1), self.now_secs));
             return;
         }
         self.store_view(); // the working copy, before it's replaced
@@ -311,7 +330,7 @@ impl NaviApp {
         self.active_view = self.views.active(&self.db_key);
         self.view_filter = self.active_view.filter(&self.cfg.dailies_dirs);
         self.group_spec  = self.active_view.spec();
-        self.grouping.memory.slots = self.active_view.auto_colours.clone();
+        self.grouping.forget_partitions(); // keys from what's remembered, not the last view's partition
         self.panel = PanelState::default();
         let n = self.views.views(&self.db_key).len();
         let k = self.views.active_index(&self.db_key);
@@ -349,7 +368,12 @@ impl NaviApp {
                         self.panel.rename_error = None;
                         self.flush_views(true);
                     }
-                    Err(e) => self.panel.rename_error = Some(e),
+                    Err(e) => {
+                        // Enter (or the button) took the keyboard from the
+                        // field: give it back, or the next keys fire shortcuts
+                        self.panel.rename_error = Some(e);
+                        self.panel.rename_focus = true;
+                    }
                 }
             }
             ViewOp::Delete => {
@@ -366,7 +390,7 @@ impl NaviApp {
     fn apply_panel(&mut self, out: PanelOut) {
         if out.panel { self.toggle_panel(); }
         if out.filter { self.filter_changed(); }
-        if out.groups { self.groups_changed(); }
+        if out.groups { self.groups_changed(); } else if out.group_style { self.group_restyled(); }
         if out.pull {
             self.store_view();
             self.apply_group_pull();
@@ -1087,8 +1111,11 @@ impl NaviApp {
         const MAX_ROWS: usize = 12;
         let rows: Vec<(Color32, String, bool)> = {
             let bg = [t.bg.r(), t.bg.g(), t.bg.b()];
-            let mut v: Vec<(Color32, String, bool)> = self.groups.groups.iter()
-                .filter(|g| g.manual || g.shown > 0 || !g.visible)
+            let listed = |g: &&navi_core::groups::GroupInfo| g.manual || g.shown > 0 || !g.visible;
+            // only the rows drawn are formatted (thousands of tags or communities)
+            let total = self.groups.groups.iter().filter(listed).count();
+            let fits  = if total > MAX_ROWS { MAX_ROWS - 1 } else { total };
+            let mut v: Vec<(Color32, String, bool)> = self.groups.groups.iter().filter(listed).take(fits)
                 .map(|g| {
                     let c = g.colour.rgb(bg);
                     let label = if !g.visible { format!("{}  hidden", g.label) }
@@ -1096,11 +1123,7 @@ impl NaviApp {
                                 else { format!("{}  {}", g.label, g.shown) };
                     (Color32::from_rgb(c[0], c[1], c[2]), label, g.visible && g.error.is_none())
                 }).collect();
-            if v.len() > MAX_ROWS {
-                let more = v.len() - (MAX_ROWS - 1);
-                v.truncate(MAX_ROWS - 1);
-                v.push((Color32::TRANSPARENT, format!("+{more} more"), false));
-            }
+            if total > fits { v.push((Color32::TRANSPARENT, format!("+{} more", total - fits), false)); }
             v
         };
         let title = if self.grouping.community.pending() && rows.is_empty() { "Computing communities…".to_string() }

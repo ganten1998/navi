@@ -20,7 +20,7 @@ All notable changes to Navi are documented here.
     picker, its name, its query (a parse error shows right under it), how
     many nodes match, and visible / pull / hull switches; a group can be
     deleted. "Add group" starts from the search being typed (or the last
-    one searched). "Group by" picks the automatic grouper with its
+    one searched), as a group query matching the same notes. "Group by" picks the automatic grouper with its
     setting (folder depth, community resolution, communities computed on
     all links or on what's visible), switches pull and hull for every
     automatic group, and lists the automatic groups so each can be hidden.
@@ -48,20 +48,24 @@ All notable changes to Navi are documented here.
   group hides only nodes whose every group is hidden, and it happens before
   orphans are worked out, like the dailies filter.
 - **Stable group colours**, readable on every theme: manual groups store
-  theirs, folder/tag/file groups keep a remembered palette slot per name
-  (a new tag never repaints an old one), and components/communities keep
-  theirs across recomputation by overlap matching (also while a large
-  graph's communities recompute in the background, where the previous
-  partition keeps showing). Hiding a component or community stays with
-  that cluster: it's keyed by one of its notes, not its size rank.
-  Ungrouped nodes and orphans keep the theme's node colour.
+  theirs, and every automatic group's palette slot is remembered per db,
+  so a tag or cluster has one colour in every view and after a restart, and
+  a new group never repaints an old one. Two groups first seen apart that
+  landed on one colour get two once they show together. Components and
+  communities follow their notes across recomputation by overlap matching
+  (also while a large graph's communities recompute in the background,
+  where the previous partition keeps showing). Hiding a component or
+  community stays with that cluster: it's keyed by one of its notes, not
+  its size rank, and stays hidden after another view was shown. Ungrouped
+  nodes keep the theme's node colour, and orphans are in no component or
+  community.
 - **Query language** for the search box and group queries: `tag:`, `dir:`,
   `path:`, `file:`, `title:` (text or `/regex/`), `alias:`, `level:`,
   `degree:`, `prop:KEY=VAL`, `daily`, `orphan`, `dangling`, `AND` / `OR` /
   `NOT` / `-`, parentheses and quoted phrases. Plain words still search
   titles and aliases, and so does text that only looks like syntax
-  (`Rust - Ownership`, `Path: x`; bare `daily` also finds "Daily Review",
-  `is:daily` is the predicate alone). Search text that doesn't parse
+  (`Rust - Ownership`, `Path: x`; in the search box bare `daily` also finds
+  "Daily Review", while in a group it is the predicate alone). Search text that doesn't parse
   (`(draft`) is matched as plain text with the error and its column in the
   status bar; a group query that doesn't parse matches nothing and shows
   why. `path:` takes absolute paths, and an absolute `dir:` ignores the
@@ -72,8 +76,10 @@ All notable changes to Navi are documented here.
   and the last one used is remembered. Loading keeps everything that
   parses (a bad entry is dropped alone, bytes that aren't UTF-8 are
   replaced, and the original file is copied to `views.json.bad` first); a
-  views.json that can't be read at all is never written over. Saves are
-  atomic and keep what another navi window saved for another db. A db that
+  views.json that can't be read at all is never written over. Keys navi
+  doesn't know (a newer navi's, or your own) are kept on save. Saves are
+  atomic, write through a symlinked file, keep what another navi window
+  saved for another db, and a failed save is retried instead of dropped. A db that
   doesn't exist yet keys the same as it will once it does.
 - `Shift-G` cycles the automatic grouper; a legend (top left) lists the
   groups with how many of their nodes are on screen while groups are shown.
@@ -88,7 +94,9 @@ All notable changes to Navi are documented here.
   `links_to_dailies_count`, and a new `config.json` key, `dailies_dirs`
   (which directory names mark a daily). The modes read back in any case
   (and as `"shown"` / `"hidden"`), and a bad value in `config.json` resets
-  only its own key instead of the whole file.
+  only its own key instead of the whole file (the original is kept as
+  `config.json.bad`). A `config.json` that can't be read or isn't JSON (a
+  typo) is no longer replaced with defaults at startup.
 - **Unresolved links are counted**: `fuzzy` links and `id:` links to a
   missing node used to vanish silently; they're now kept as dangling links
   and counted (help panel, startup log).
@@ -104,7 +112,8 @@ All notable changes to Navi are documented here.
 - The `dailies`, `orphans` and `links_to_dailies_count` settings moved from
   `config.json` into the active view. Existing values carry over on the
   first run, and leave `config.json` only after `views.json` holding them
-  is written. `config.json` is now saved atomically too.
+  is written. `config.json` is now saved atomically too, and through a
+  symlink (a dotfiles repo's copy stays the one in use).
 - Group pull is weak by default (`group_pull: 0.1`) so links between groups
   stay readable; it pauses like the rest of the physics once things settle.
   Changing it while physics runs shows at once, and in the Column and Tree
@@ -116,7 +125,10 @@ All notable changes to Navi are documented here.
   carries no Dropbox or Finder metadata, and is built with LTO (the release
   profile now sits at the workspace root, where cargo reads it). The
   Linux/Windows packaging script uses the same build directory, so it can't
-  package an old binary.
+  package an old binary. Linux tarballs no longer carry macOS `._` files,
+  the Windows step finds Homebrew's llvm (and says so up front when it's
+  missing), an ad-hoc macOS build never replaces the release zip, and the
+  script points uploads at the Codeberg releases page.
 - `views.json` is written shortly after the last edit (typing a query
   doesn't write once per key) and again on exit; every write is atomic.
 

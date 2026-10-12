@@ -15,7 +15,7 @@ use egui::{Align, Color32, CursorIcon, Layout, Pos2, RichText, Sense, Stroke, Te
 use navi_core::{
     groups::{luminance, new_group_colour, AutoGrouper, CommunityScope, Group, GroupColour},
     view::relative_to_root,
-    DailiesMode, OrphansMode,
+    DailiesMode, OrphansMode, Query,
 };
 
 use super::NaviApp;
@@ -33,6 +33,17 @@ pub struct PanelState {
     pub rename_focus:   bool,           // give the rename field the keyboard the frame it opens
     pub confirm_delete: bool,           // "Delete view?" asked inline
     pub drag_from:      Option<usize>,  // manual group row being dragged by its handle
+    autos:              Option<((u64, usize), Vec<AutoRow>)>, // the automatic groups list, per (view_gen, theme)
+}
+
+/// One row of the automatic groups list, built once per recompute.
+pub struct AutoRow {
+    key:     String,
+    label:   String,
+    short:   String, // the label, cut to fit
+    colour:  Color32,
+    members: usize,
+    shown:   usize,
 }
 
 /// A change to the list of views (applied by NaviApp::apply_view_op).
@@ -42,6 +53,7 @@ pub enum ViewOp { Switch(usize), New, Duplicate, Rename(String), Delete }
 #[derive(Default)]
 pub struct PanelOut {
     pub groups:  bool,           // manual groups, the auto grouper or the group display
+    pub group_style: bool,       // only a manual group's colour or name (no re-resolve)
     pub filter:  bool,           // dailies / orphans / links_to_dailies_count
     pub pull:    bool,           // group pull strength
     pub physics: bool,           // pause / resume pressed
@@ -266,7 +278,7 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
                 if grip(ui, t, drag_from == Some(gi)).drag_started() { app.panel.drag_from = Some(gi); }
                 let shown = g.colour.unwrap_or_else(|| info.map_or([128, 128, 128], |i| i.colour.rgb(bg)));
                 let mut c = shown;
-                if ui.color_edit_button_srgb(&mut c).on_hover_text("Colour").changed() { g.colour = Some(c); out.groups = true; }
+                if ui.color_edit_button_srgb(&mut c).on_hover_text("Colour").changed() { g.colour = Some(c); out.group_style = true; }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     if ui.small_button("\u{1F5D1}").on_hover_text("Delete this group").clicked() { remove = Some(gi); }
@@ -279,7 +291,7 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
                     if ui.add(TextEdit::singleline(&mut g.name).hint_text("Name").desired_width(f32::INFINITY)).changed() {
                         // a colour taken from the name's hash would change with every key: keep the one shown
                         g.colour.get_or_insert(shown);
-                        out.groups = true;
+                        out.group_style = true;
                     }
                 });
             });
@@ -320,17 +332,11 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
     if let Some((a, b)) = swap { app.active_view.groups.swap(a, b); out.groups = true; }
     if let Some(k) = remove { app.active_view.groups.remove(k); out.groups = true; }
 
-    // Add group: prefilled from the search being typed, else the last one
-    let prefill = if app.search_active && !app.search_query.trim().is_empty() { app.search_query.clone() } else { app.last_search.clone() };
+    let prefill = add_group_query(app);
     let add = ui.button("Add group");
     let add = if prefill.trim().is_empty() { add } else { add.on_hover_text(format!("Query: {prefill}")) };
     if add.clicked() {
-        let names: Vec<&str> = app.active_view.groups.iter().map(|g| g.name.as_str()).collect();
-        let name = (app.active_view.groups.len() + 1..).map(|k| format!("Group {k}")).find(|s| !names.contains(&s.as_str())).expect("unbounded");
-        let mut g = Group::new(&name, prefill.trim());
-        g.colour = Some(new_group_colour(&app.active_view.groups, &name, bg));
-        app.active_view.groups.push(g);
-        app.active_view.colour_groups = true; // a group you can't see would look like nothing happened
+        add_group(app, bg);
         out.groups = true;
     }
 
@@ -381,34 +387,65 @@ fn groups_section(app: &mut NaviApp, ui: &mut Ui, t: &Theme, out: &mut PanelOut)
             if ui.toggle_value(&mut v.auto_hull, "Hull").on_hover_text("Hulls for every automatic group").changed() { out.groups = true; }
             if app.grouping.community.pending() { ui.label(weak(t, "computing...")); }
         });
-        let autos: Vec<(String, String, Color32, usize, usize)> = app.groups.groups.iter().filter(|g| !g.manual)
-            .map(|g| (g.key.clone(), g.label.clone(), rgb(g.colour.rgb(bg)), g.members, g.shown)).collect();
+        // built once per recompute, and only the rows in sight are laid out:
+        // a db with thousands of tags or communities costs a screenful
+        let at = (app.view_gen, app.theme_idx);
+        if app.panel.autos.as_ref().map(|(k, _)| *k) != Some(at) {
+            let rows = app.groups.groups.iter().filter(|g| !g.manual).map(|g| AutoRow {
+                key: g.key.clone(), label: g.label.clone(), short: g.label.chars().take(36).collect(),
+                colour: rgb(g.colour.rgb(bg)), members: g.members, shown: g.shown,
+            }).collect();
+            app.panel.autos = Some((at, rows));
+        }
+        let autos = app.panel.autos.take().map(|(_, r)| r).unwrap_or_default();
         if autos.is_empty() {
             ui.label(weak(t, "Nothing to group here."));
         } else {
             egui::CollapsingHeader::new(weak(t, format!("{} automatic groups", autos.len())))
                 .id_salt("navi-auto-groups").default_open(autos.len() <= 12)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("navi-auto-scroll").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                        for (key, label, c, members, shown) in autos {
-                            ui.horizontal(|ui| {
-                                let mut vis = !v.auto_hidden.contains(&key);
-                                if ui.checkbox(&mut vis, "").on_hover_text("Visible").changed() {
-                                    if vis { v.auto_hidden.retain(|k| k != &key); } else { v.auto_hidden.push(key.clone()); }
-                                    out.groups = true;
-                                }
-                                let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                                ui.painter().circle_filled(r.center(), 5.0, c);
-                                let l: String = label.chars().take(36).collect();
-                                ui.label(RichText::new(l).color(if vis { t.bar_text } else { t.label }).size(12.5))
-                                    .on_hover_text(format!("{label}\n{members} matching, {shown} on screen"));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| { ui.label(weak(t, members.to_string())); });
-                            });
-                        }
-                    });
+                    let row_h = ui.spacing().interact_size.y;
+                    egui::ScrollArea::vertical().id_salt("navi-auto-scroll").max_height(220.0).auto_shrink([false, true])
+                        .show_rows(ui, row_h, autos.len(), |ui, range| {
+                            for row in &autos[range] {
+                                ui.horizontal(|ui| {
+                                    ui.set_min_height(row_h);
+                                    let mut vis = !v.auto_hidden.contains(&row.key);
+                                    if ui.checkbox(&mut vis, "").on_hover_text("Visible").changed() {
+                                        if vis { v.auto_hidden.retain(|k| k != &row.key); } else { v.auto_hidden.push(row.key.clone()); }
+                                        out.groups = true;
+                                    }
+                                    let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 5.0, row.colour);
+                                    ui.label(RichText::new(&row.short).color(if vis { t.bar_text } else { t.label }).size(12.5))
+                                        .on_hover_ui(|ui| { ui.label(format!("{}\n{} matching, {} on screen", row.label, row.members, row.shown)); });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| { ui.label(weak(t, row.members.to_string())); });
+                                });
+                            }
+                        });
                 });
         }
+        app.panel.autos = Some((at, autos));
     }
+}
+
+/// "Add group" starts from the search being typed, else the last one, as a
+/// group query matching what that search matched (text the search only
+/// matched as plain text is quoted, so the group isn't a parse error).
+fn add_group_query(app: &NaviApp) -> String {
+    let typed = if app.search_active && !app.search_query.trim().is_empty() { &app.search_query } else { &app.last_search };
+    Query::group_source(typed)
+}
+
+/// Append a group from `add_group_query`, with a colour no group has.
+pub(super) fn add_group(app: &mut NaviApp, bg: [u8; 3]) {
+    let query = add_group_query(app);
+    let names: Vec<&str> = app.active_view.groups.iter().map(|g| g.name.as_str()).collect();
+    let name = (app.active_view.groups.len() + 1..).map(|k| format!("Group {k}")).find(|s| !names.contains(&s.as_str())).expect("unbounded");
+    let mut g = Group::new(&name, &query);
+    g.colour = Some(new_group_colour(&app.active_view.groups, &name, bg));
+    app.active_view.groups.push(g);
+    app.active_view.colour_groups = true; // a group you can't see would look like nothing happened
 }
 
 // ── 4. Physics ────────────────────────────────────────────────────────────────

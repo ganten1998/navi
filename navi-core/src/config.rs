@@ -26,6 +26,10 @@ pub struct Config {
     pub orphans: Option<OrphansMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub links_to_dailies_count: Option<bool>,
+    // config.json exists but couldn't be read or isn't a JSON object (a
+    // hand edit's typo): this session runs on defaults and never writes it
+    #[serde(skip)]
+    pub keep_file:              bool,
 }
 
 /// The view filters an older config.json carried.
@@ -51,6 +55,7 @@ impl Default for Config {
             dailies: None,
             orphans: None,
             links_to_dailies_count: None,
+            keep_file: false,
         }
     }
 }
@@ -83,27 +88,55 @@ impl Config {
 
     pub fn load() -> Self { Self::load_from(&Self::config_path()) }
 
+    /// Load config.json; a missing file is the defaults. Startup saves what
+    /// it loaded, so nothing is lost without a copy: a file that can't be
+    /// read or isn't a JSON object (a typo) is never written over this
+    /// session (`keep_file`); one whose bad values were dropped, or that
+    /// isn't UTF-8, is copied to config.json.bad first.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(s)  => Self::parse(&s),
-            Err(_) => Config::default(),
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
+            Err(e) => {
+                eprintln!("navi: couldn't read {}: {e}; using defaults, not writing it", path.display());
+                return Config { keep_file: true, ..Config::default() };
+            }
+        };
+        let text  = String::from_utf8_lossy(&bytes);
+        let lossy = matches!(text, std::borrow::Cow::Owned(_));
+        let Some((cfg, dropped)) = Self::parse_report(&text) else {
+            eprintln!("navi: {} is not a JSON object; using defaults, not writing it", path.display());
+            return Config { keep_file: true, ..Config::default() };
+        };
+        if dropped || lossy {
+            let bad = path.with_extension("json.bad");
+            if std::fs::write(&bad, &bytes).is_ok() { eprintln!("navi: config.json: the original is kept as {}", bad.display()); }
         }
+        cfg
     }
 
     /// Parse config.json. One bad value must not cost every other setting
     /// (startup saves what it loaded): a key whose value doesn't parse falls
     /// back to its default alone, the rest are kept.
-    pub fn parse(s: &str) -> Self {
-        if let Ok(c) = serde_json::from_str(s) { return c; }
+    pub fn parse(s: &str) -> Self { Self::parse_report(s).map_or_else(Config::default, |(c, _)| c) }
+
+    /// `parse`, plus whether a value was dropped; None when `s` isn't a JSON
+    /// object at all.
+    fn parse_report(s: &str) -> Option<(Self, bool)> {
         match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(serde_json::Value::Object(user)) => parse_tolerant(user, "config.json").0,
-            _ => Config::default(),
+            Ok(serde_json::Value::Object(user)) => Some(parse_tolerant(user, "config.json")),
+            _ => None,
         }
     }
 
-    pub fn save(&self) { let _ = self.save_to(&Self::config_path()); }
+    pub fn save(&self) {
+        if let Err(e) = self.save_to(&Self::config_path()) { eprintln!("navi: config.json not saved: {e}"); }
+    }
 
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if self.keep_file {
+            return Err(std::io::Error::other("not written: it couldn't be read or parsed when navi started"));
+        }
         let s = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         atomic_write(path, &s)
     }
@@ -129,10 +162,24 @@ pub fn parse_tolerant<T: DeserializeOwned + Default>(user: serde_json::Map<Strin
     (serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default(), dropped)
 }
 
+/// `path` with symlinks followed to the file they name (a dangling link
+/// too): a save writes THROUGH a link (config.json kept in a dotfiles repo)
+/// instead of replacing the link with a plain file.
+fn link_target(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    for _ in 0..40 { // a loop of links: give up, write at the last one
+        let is_link = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(t) = is_link.then(|| std::fs::read_link(&p).ok()).flatten() else { break };
+        p = if t.is_absolute() { t } else { p.parent().unwrap_or(Path::new("")).join(t) };
+    }
+    p
+}
+
 /// Write `data` to `path` all at once: a temp file in the same directory,
 /// flushed, then renamed over the target. A crash mid-save leaves the old
-/// file, never half of the new one.
+/// file, never half of the new one. A symlinked `path` writes its target.
 pub fn atomic_write(path: &Path, data: &str) -> std::io::Result<()> {
+    let path = &link_target(path);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "navi".into());
@@ -267,6 +314,54 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-")).collect();
         assert!(leftovers.is_empty(), "temp file renamed away");
         assert_eq!(Config::load_from(&dir.join("missing.json")).server_name, "server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A typo (trailing comma) runs on defaults and never overwrites the
+    /// file; a dropped bad value is backed up before the save.
+    #[test]
+    fn a_broken_config_json_is_never_lost() {
+        let dir = std::env::temp_dir().join(format!("navi-cfg-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let typo = "{ \"db\": \"/my/roam.db\", \"borderless\": true, \"dailies\": \"hide\", }";
+        std::fs::write(&path, typo).unwrap();
+        let c = Config::load_from(&path);
+        assert!(c.keep_file && c.db.is_empty());
+        assert!(c.save_to(&path).is_err(), "refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), typo, "untouched");
+        // a bad value: the rest loads, the original is kept as .bad, saving works
+        let bad_value = r#"{ "db": "/my/roam.db", "orphans": "sometimes" }"#;
+        std::fs::write(&path, bad_value).unwrap();
+        let c = Config::load_from(&path);
+        assert!(!c.keep_file && c.db == "/my/roam.db");
+        assert_eq!(std::fs::read_to_string(dir.join("config.json.bad")).unwrap(), bad_value);
+        c.save_to(&path).unwrap();
+        assert!(Config::load_from(&path).db == "/my/roam.db");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// config.json symlinked into a dotfiles repo: a save writes the target
+    /// and the link stays a link (relative and dangling links too).
+    #[cfg(unix)]
+    #[test]
+    fn saving_writes_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("navi-cfg-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dot")).unwrap();
+        let (real, link) = (dir.join("dot").join("config.json"), dir.join("config.json"));
+        std::fs::write(&real, "{}").unwrap();
+        std::os::unix::fs::symlink("dot/config.json", &link).unwrap();
+        let c = Config { db: "/x.db".into(), ..Config::load_from(&link) };
+        c.save_to(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(Config::load_from(&real).db, "/x.db", "the target was written");
+        // dangling: the target is created
+        std::fs::remove_file(&real).unwrap();
+        c.save_to(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(Config::load_from(&real).db, "/x.db");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

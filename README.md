@@ -78,7 +78,7 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
 | `borderless` | Draw the window without titlebar/decorations (default `false`). Leave off under tiling WMs: a decorated, resizable window is what lets AeroSpace / i3 tile it. |
 | `dailies_dirs` | Directory names that mark a daily note (default `daily`, `dailies`, `journal`, `journals`). Matched as whole path components, case-insensitively, `/` or `\` separated, so `dailyish/` and `daily.org` don't match. Only directories *below* the notes root (the deepest folder every note shares) count, so notes kept under e.g. `~/Journal/roam/` aren't all dailies. A `YYYY-MM-DD` title is always a daily. |
 
-A bad value in any key falls back to that key's default alone; the rest of the file is kept. Saves are atomic (a temp file renamed into place).
+A bad value in any key falls back to that key's default alone; the rest of the file is kept, and the original is first copied to `config.json.bad`. A config.json that can't be read or isn't JSON at all (a trailing comma after a hand edit) is never written over: navi runs on defaults for that session and leaves the file for you to fix. Saves are atomic (a temp file renamed into place), and a config.json that is a symlink (into a dotfiles repo, say) is written through: the link stays a link.
 
 The filters `dailies`, `orphans` and `links_to_dailies_count` used to live here. They now belong to a [view](#views-and-groups): on the first run with a db that has no views yet, its `Default` view takes whatever values config.json had, and only once `views.json` holding them is written are the keys dropped from config.json.
 
@@ -114,11 +114,11 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | `folder` | Directory below the notes root (the deepest folder every note shares), `depth` levels deep. Notes directly in the root stay ungrouped. |
 | `tag` | One group per tag. A node with several tags is in all of them and coloured by the first alphabetically (never by database order). |
 | `component` | Connected pieces of the graph left by the dailies filter, largest first. Orphans are not grouped. |
-| `community` | Densely linked clusters (Louvain modularity with a connectivity refinement, so every community is connected; deterministic, seeded). `resolution` above 1 makes more, smaller communities. Computed on every real link by default (`"scope": "all"`), or on what the dailies filter leaves (`"scope": "visible"`). Large graphs compute in the background. |
+| `community` | Densely linked clusters (Louvain modularity with a connectivity refinement, so every community is connected; deterministic, seeded). `resolution` above 1 makes more, smaller communities. Computed on every real link by default (`"scope": "all"`), or on what the dailies filter leaves (`"scope": "visible"`). Large graphs compute in the background. Orphans of the view are not grouped, even when a hidden daily links them. |
 | `file` | A file node with its heading nodes. Files without headings stay ungrouped. |
 
 - **Hiding** a group hides only the nodes whose *every* group is hidden; nodes in no group are never hidden by groups. Hiding happens before orphans are worked out, like the dailies filter: a note whose only links went into a hidden group becomes an orphan ("isolated by filters"), and `O` treats it like any other.
-- **Colours stay put.** Manual groups store their colour. Folder, tag and file groups take a palette colour from a hash of their name, remembered in the view (`auto_colours`), so a new tag never repaints an old one. Components and communities keep their colours across recomputation by matching each new group to the old group it overlaps most. Ungrouped nodes and orphans keep the theme's own node colour. The palette is readable on every theme.
+- **Colours stay put.** Manual groups store their colour. Every automatic group's colour is remembered per db (`auto_colours`), so a tag or a cluster has the same colour in every view and after a restart, and a new group never repaints an old one. Folder, tag and file groups start from a palette colour picked by a hash of their name; two groups that land on the same colour get different ones as soon as they show together. Components and communities are named after one of their notes and follow it: the group a recomputation overlaps most with the old one keeps the old name and colour. Ungrouped nodes keep the theme's own node colour. The palette is readable on every theme.
 - `G` turns the group display on and off: colours, hulls, pull and the legend (top left, with how many nodes of each group are on screen). Pressing `G` in a view with no groups starts the `tag` grouper, like the old tag colouring. Group visibility still filters while the display is off.
 
 ```json
@@ -164,9 +164,10 @@ A **group** is a query plus how it's shown: a colour (always), and per group whe
 | `orphans` | `"show"`, `"hide"` or `"only"` (`O` cycles and saves it). An orphan is a node with no link to another node *in the current view*. Hiding dailies (or a group) can isolate a note whose only links went there; the status bar counts those as "isolated by filters". |
 | `links_to_dailies_count` | When `false`, a link to a daily doesn't save a note from being an orphan: a note linked only to dailies counts as one. A daily stays connected if it links to a connected note (otherwise it's an orphan too, so `O` never leaves one drawn alone). The status bar calls these "daily-only". Only matters while dailies are shown; default `true`. |
 | `group_pull` | Strength of `pull` (default `0.1`, a slow drift; `0.5` makes tight clusters; at most `1.0`). |
-| `auto_colours` | Written by navi: the palette slot each folder / tag / file group got, so colours survive restarts. |
 
-Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Writes are atomic, and happen shortly after the last change (and on exit), so typing in the panel doesn't write once per key. `panel_open` (written by navi) remembers whether the side panel is open in that view.
+Next to a db's `views`, navi writes `auto_colours`: the palette slot every automatic group got, shared by all of that db's views, so colours survive restarts.
+
+Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Keys navi doesn't know (your own notes, or settings from a newer navi) are kept and written back as they were; a file from a newer navi is also copied to `views.json.bad` first. Writes are atomic, and happen shortly after the last change (and on exit), so typing in the panel doesn't write once per key. `panel_open` (written by navi) remembers whether the side panel is open in that view.
 
 ### Side panel
 
@@ -202,11 +203,11 @@ The search box (`/`) and group queries share one language. Terms next to each ot
 | `is:daily` | A daily note |
 | `is:orphan` | No link to anything in the current view (for groups: before group hiding) |
 | `is:dangling` | Has a link to a missing node or an unresolved `[[title]]` |
-| `daily`, `orphan`, `dangling` | The same, or a title or alias containing the word (so searching `daily` still finds "Daily Review") |
+| `daily`, `orphan`, `dangling` | The same. In the search box also a title or alias containing the word (so searching `daily` still finds "Daily Review"); in a group, only the predicate (a hidden `daily` group never hides "Daily Review") |
 | `A OR B`, `A AND B`, `NOT A`, `-A` | Either, both, neither. `AND` binds tighter than `OR`; `-` works on a term or a group: `-(tag:a OR tag:b)` |
 | `( ... )` | Grouping |
 
-Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text stays plain text: a word whose part before `:` isn't one of the keys above (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone `-` (`Rust - Ownership`). A value starting with `/` is a regex only when the closing `/` ends it, so `path:/n/posts` is a path and `title:/^draft/` a regex. While the search doesn't parse (`(draft`), it matches as plain text, the old way, and the status bar says why and where (`col 1: missing ')' for this '('`); a group query that doesn't parse matches nothing and shows the error. `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
+Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text stays plain text: a word whose part before `:` isn't one of the keys above (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone `-` (`Rust - Ownership`). A value starting with `/` is a regex only when the closing `/` ends it, so `path:/n/posts` is a path and `title:/^draft/` a regex. While the search doesn't parse (`(draft`), it matches as plain text, the old way, and the status bar says why and where (`col 1: missing ')' for this '('`); a group query that doesn't parse matches nothing and shows the error. "Add group" turns the search into a group query that matches the same notes (quoted, when the search only matched as plain text). `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
 
 ---
 
@@ -305,7 +306,8 @@ navi/                     Binary: UI, rendering, event loop
   src/painter.rs          GraphPainter: grid, group hulls, edges, nodes, labels
   src/macos_display.rs    macOS CADisplayLink + tier control
   src/theme.rs            Colour themes
-scripts/build-macos.sh    Cargo build + Navi.app + zip for release
+scripts/build-macos.sh    Cargo build + Navi.app, Developer ID signing, notarization, zip for release
+scripts/build-cross.sh    Linux (zig) and Windows (cargo-xwin, needs Homebrew llvm) release builds
 assets/icon.png           App icon (bundle icns is generated from this)
 assets/navi.desktop       Linux desktop entry (shipped in the Linux tarball)
 ```

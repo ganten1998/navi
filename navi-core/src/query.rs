@@ -17,8 +17,10 @@
 //! `is:daily` / `is:orphan` / `is:dangling`. A bare word, a "quoted phrase"
 //! or a bare `/regex/` matches title or alias, case-insensitively, so plain
 //! search text behaves as it always did. Bare `daily` / `orphan` / `dangling`
-//! match that predicate OR the word in a title or alias (`is:` for only the
-//! predicate). Also bare text: a word whose prefix before `:` is not a key
+//! are the predicate (same as `is:`); in the search box (`Query::search`)
+//! they also match the word in a title or alias, so searching `daily` still
+//! finds "Daily Review" while a group `daily` holds only daily notes. Also
+//! bare text: a word whose prefix before `:` is not a key
 //! (`http://x`, `Rust:`), a key followed by a space (`Path: x`), and a lone
 //! `-` (`Book - Chapter`). A value starting with `/` is a regex only when its
 //! closing `/` ends the term (`path:/n/posts` is a path). Operators are upper
@@ -27,7 +29,8 @@
 //!
 //! Parsing never panics: every error carries the character column it was
 //! found at. The search box uses `Query::search`, which falls back to the old
-//! whole-text substring match when the text doesn't parse.
+//! whole-text substring match when the text doesn't parse; `group_source`
+//! turns search text into a group query that matches the same nodes.
 
 use regex::{Regex, RegexBuilder};
 use std::fmt;
@@ -248,9 +251,10 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, QueryError> {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 struct Parser {
-    toks: Vec<(Tok, usize)>,
-    at:   usize,
-    end:  usize, // char length of the source (error position at end of input)
+    toks:   Vec<(Tok, usize)>,
+    at:     usize,
+    end:    usize, // char length of the source (error position at end of input)
+    search: bool,  // the search box: bare predicate words match titles too
 }
 
 impl Parser {
@@ -319,7 +323,7 @@ impl Parser {
             Tok::Close => err(p, "unexpected ')'"),
             Tok::And | Tok::Or => err(p, "AND / OR need a term on both sides"),
             Tok::Not | Tok::Minus => unreachable!("unary() consumes negation"),
-            Tok::Term { key, val, vpos } => term(key.as_deref(), val, vpos),
+            Tok::Term { key, val, vpos } => term(key.as_deref(), val, vpos, self.search),
         }
     }
 }
@@ -362,14 +366,19 @@ fn path_parts(s: &str) -> Vec<String> {
     s.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".").map(|c| c.to_string()).collect()
 }
 
-fn term(key: Option<&str>, val: Val, vpos: usize) -> Result<Expr, QueryError> {
+fn term(key: Option<&str>, val: Val, vpos: usize, search: bool) -> Result<Expr, QueryError> {
     let Some(key) = key else {
-        // bare daily / orphan / dangling: the predicate, or the word in a
-        // title (searching "daily" still finds "Daily Review")
+        // bare daily / orphan / dangling: the predicate; in the search box
+        // also the word in a title (searching "daily" still finds "Daily
+        // Review"), never in a group (a hidden `daily` group hides dailies)
         if let Val::Plain(w) = &val {
             let w = w.to_lowercase();
             let pred = match w.as_str() { "daily" => Some(Pred::Daily), "orphan" => Some(Pred::Orphan), "dangling" => Some(Pred::Dangling), _ => None };
-            if let Some(p) = pred { return Ok(Expr::Or(vec![Expr::Pred(p), Expr::Pred(Pred::Bare(Text::Sub(w)))])); }
+            match pred {
+                Some(p) if search => return Ok(Expr::Or(vec![Expr::Pred(p), Expr::Pred(Pred::Bare(Text::Sub(w)))])),
+                Some(p) => return Ok(Expr::Pred(p)),
+                None => {}
+            }
         }
         return Ok(Expr::Pred(Pred::Bare(text(val, vpos, false)?)));
     };
@@ -493,11 +502,14 @@ impl Expr {
 }
 
 impl Query {
-    pub fn parse(src: &str) -> Result<Query, QueryError> {
+    /// Groups and filters: the language exactly.
+    pub fn parse(src: &str) -> Result<Query, QueryError> { Self::parse_as(src, false) }
+
+    fn parse_as(src: &str, search: bool) -> Result<Query, QueryError> {
         let toks = lex(src)?;
         let end  = src.chars().count();
         if toks.is_empty() { return Ok(Query { src: src.to_string(), expr: Expr::All }); }
-        let mut p = Parser { toks, at: 0, end };
+        let mut p = Parser { toks, at: 0, end, search };
         let expr = p.or()?;
         if p.at < p.toks.len() {
             let pos = p.pos();
@@ -506,14 +518,44 @@ impl Query {
         Ok(Query { src: src.to_string(), expr })
     }
 
-    /// The search box: `parse`, or when the text doesn't parse, the old
-    /// search (title or alias contains the whole text, any case) plus the
-    /// error, to show as a hint. Plain search text never stops working.
+    /// The search box: `parse` (bare `daily` / `orphan` / `dangling` also
+    /// match the word in a title or alias), or when the text doesn't parse,
+    /// the old search (title or alias contains the whole text, any case)
+    /// plus the error, to show as a hint. Plain search text never stops
+    /// working.
     pub fn search(src: &str) -> (Query, Option<QueryError>) {
-        match Query::parse(src) {
+        match Query::parse_as(src, true) {
             Ok(q)  => (q, None),
             Err(e) => (Query { src: src.to_string(), expr: Expr::Pred(Pred::Bare(Text::Sub(src.to_lowercase()))) }, Some(e)),
         }
+    }
+
+    /// A group query that matches what `search(src)` matches ("Add group"
+    /// from the search box): the text itself when it means the same as a
+    /// group query; the whole text quoted when the search fell back to plain
+    /// text; bare `daily` / `orphan` / `dangling` widened to the title match
+    /// the search gives them.
+    pub fn group_source(src: &str) -> String {
+        let src = src.trim();
+        let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let Ok(toks) = lex(src) else { return quote(src) };
+        if Query::parse(src).is_err() { return quote(src); }
+        // rebuild only when a bare predicate word is in it
+        let widen = |t: &Tok| matches!(t, Tok::Term { key: None, val: Val::Plain(w), .. }
+                                        if matches!(w.to_lowercase().as_str(), "daily" | "orphan" | "dangling"));
+        if !toks.iter().any(|(t, _)| widen(t)) { return src.to_string(); }
+        let cs: Vec<char> = src.chars().collect();
+        let mut out = String::new();
+        let mut last = 0;
+        for (t, at) in &toks {
+            let Tok::Term { key: None, val: Val::Plain(w), .. } = t else { continue };
+            if !widen(t) { continue; }
+            out.extend(&cs[last..*at]);
+            out.push_str(&format!("({w} OR \"{w}\")"));
+            last = at + w.chars().count();
+        }
+        out.extend(&cs[last..]);
+        out
     }
 
     /// Matches every node (empty or blank source).
@@ -573,6 +615,55 @@ mod tests {
     }
 
     fn perr(q: &str) -> QueryError { Query::parse(q).expect_err(q) }
+
+    /// What the search box matches (`Query::search`).
+    fn sids(g: &Graph, q: &str) -> Vec<String> {
+        let v  = compute_view(g, &ViewFilter::default());
+        let cx = EvalCtx::from_view(g, &v);
+        let m  = Query::search(q).0.eval_all(&cx);
+        (0..m.len()).filter(|&i| m[i]).map(|i| g.node_list[i].id.clone()).collect()
+    }
+
+    /// Groups use the predicate alone: a `daily` group never takes "Daily
+    /// Review" (and hiding it never hides that note); `-orphan` never drops
+    /// a linked "Orphan Black". The search box still finds both by title.
+    #[test]
+    fn bare_predicate_words_are_exact_in_groups() {
+        let g = Graph::new(vec![
+            node("c", "Daily Review", "/n/c.org", &["x"]),
+            node("d", "2026-09-01", "/n/daily/2026-09-01.org", &[]),
+            node("f", "Orphan Black", "/n/f.org", &["x"]),
+            node("o", "Alone", "/n/o.org", &["x"]),
+        ], vec![("c".into(), "d".into()), ("f".into(), "c".into())]);
+        assert_eq!(ids(&g, "daily"), vec!["d"]);
+        assert_eq!(ids(&g, "orphan"), vec!["o"]);
+        assert_eq!(ids(&g, "tag:x -orphan"), vec!["c", "f"], "a linked note titled Orphan stays");
+        assert_eq!(sids(&g, "daily"), vec!["c", "d"]);
+        assert_eq!(sids(&g, "orphan"), vec!["f", "o"]);
+        assert_eq!(sids(&g, "tag:x -orphan"), vec!["c"]);
+    }
+
+    /// "Add group" from the search box: the group matches what the search
+    /// showed, also for text that only matched as plain text.
+    #[test]
+    fn group_source_matches_what_the_search_matched() {
+        let g = Graph::new(vec![
+            node("a", "Lonely (draft", "/n/a.org", &[]),
+            node("b", "\"rust\" notes", "/n/b.org", &[]),
+            node("c", "/tmp files", "/n/c.org", &[]),
+            node("d", "Daily Review", "/n/d.org", &["x"]),
+            node("e", "2026-09-01", "/n/daily/2026-09-01.org", &[]),
+            node("f", "back\\slash \"q", "/n/f.org", &[]),
+        ], vec![("d".into(), "e".into())]);
+        for src in ["lonely (draft", "\"rust", "/tmp", "daily", "tag:x OR daily", "-daily", "back\\slash \"q", " rust ", "", "orphan dangling"] {
+            let group = Query::group_source(src);
+            assert!(Query::parse(&group).is_ok(), "{src:?} -> {group:?}");
+            assert_eq!(ids(&g, &group), sids(&g, src), "{src:?} -> {group:?}");
+        }
+        assert_eq!(Query::group_source("tag:x OR dir:posts"), "tag:x OR dir:posts", "text that parses is kept");
+        assert_eq!(Query::group_source("lonely (draft"), "\"lonely (draft\"");
+        assert_eq!(Query::group_source("Daily"), "(Daily OR \"Daily\")");
+    }
 
     #[test]
     fn bare_words_match_title_or_alias_like_the_old_search() {
@@ -706,14 +797,15 @@ mod tests {
         assert_eq!(ids(&g, "rust - ownership"), vec!["a"]);
         assert_eq!(ids(&g, "Book - Chapter"), Vec::<String>::new());
         assert_eq!(ids(&g, "-"), vec!["a", "d"], "a lone '-' is a word");
-        assert_eq!(ids(&g, "-(daily)"), vec!["a", "b", "e", "f"], "'-' before '(' still negates");
+        assert_eq!(ids(&g, "-(daily)"), vec!["a", "b", "c", "e", "f"], "'-' before '(' still negates");
+        assert_eq!(sids(&g, "-(daily)"), vec!["a", "b", "e", "f"], "the search's daily takes the title too");
         assert_eq!(ids(&g, "Path: x"), vec!["b"], "a key and a space: text");
         assert_eq!(ids(&g, "tag: x"), Vec::<String>::new());
         assert!(Query::parse("File: x").is_ok() && Query::parse("Is: x").is_ok());
-        assert_eq!(ids(&g, "daily"), vec!["c", "d"], "the daily note AND the title");
-        assert_eq!(ids(&g, "is:daily"), vec!["d"], "is: is the predicate alone");
-        assert_eq!(ids(&g, "orphan"), vec!["e", "f"]);
-        assert_eq!(Query::parse("Daily").unwrap().first_bare().as_deref(), Some("daily"));
+        assert_eq!(sids(&g, "daily"), vec!["c", "d"], "search: the daily note AND the title");
+        assert_eq!(sids(&g, "is:daily"), vec!["d"], "is: is the predicate alone");
+        assert_eq!(sids(&g, "orphan"), vec!["e", "f"]);
+        assert_eq!(Query::search("Daily").0.first_bare().as_deref(), Some("daily"));
         // text that doesn't parse: the old whole-text search, and the error
         for src in ["(draft", "lonely (draft", "\"rust"] {
             let (q, e) = Query::search(src);

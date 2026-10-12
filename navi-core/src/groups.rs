@@ -16,15 +16,21 @@
 //! classification, then the orphan filter runs. Membership therefore never
 //! depends on which groups are hidden.
 //!
-//! Colours are stable: manual groups store theirs; Folder / Tag / File groups
-//! take a slot from a hash of their key, remembered per key (a new tag never
-//! repaints an old one); Component / Community groups keep their slot across
-//! recomputation by greedy max-Jaccard matching against the previous
-//! partition. Ungrouped nodes and orphans use the theme's own node colour.
+//! Colours are stable: manual groups store theirs; every auto group's slot is
+//! remembered per key in one memory per db (views.json), so a key has the
+//! same colour in every view and across restarts, and a new key never
+//! repaints an old one. A new Folder / Tag / File key takes its hash slot (or
+//! the next one free); a new Component / Community key the lowest free slot.
+//! Two remembered keys shown together on one slot are told apart (the one at
+//! its hash slot, else the first, keeps it). Ungrouped nodes use the theme's
+//! own node colour, and Component / Community groups leave orphans out.
 //!
-//! Component / Community keys name a member ("community:<node id>", the hub
-//! at first, then inherited through the same matching), never a size rank,
-//! so a hidden cluster stays hidden when sizes reorder or navi restarts.
+//! Component / Community keys name a member ("community:<node id>"), never a
+//! size rank: a hidden key naming a member wins, else the key of the old
+//! group it overlaps most (greedy max-Jaccard against the last partition),
+//! else a remembered key naming a member, else its hub. So a hidden cluster
+//! stays hidden, and a cluster keeps its colour, when sizes reorder, when
+//! another view was shown in between, and when navi restarts.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -143,9 +149,11 @@ pub fn new_group_colour(groups: &[Group], name: &str, bg: [u8; 3]) -> [u8; 3] {
 
 // ── Colour memory (keyed auto groups) ─────────────────────────────────────────
 
-/// Slot per auto-group key. A known key keeps its slot; new keys (in sorted
-/// order, so a fresh start is deterministic) take their hash slot, or the
-/// next slot no other group of the current set uses.
+/// Slot per auto-group key, one memory per db (shared by its views). A known
+/// key keeps its slot, unless another key of the current set has it too: the
+/// one at its hash slot (else the first in group order) keeps it, the other
+/// moves to a free slot when there is one. New keys take their hash slot (or
+/// the next free one); see `assign_ranked` for partitions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColourMemory {
     pub slots: BTreeMap<String, u8>,
@@ -153,21 +161,57 @@ pub struct ColourMemory {
 
 const MEMORY_CAP: usize = 512;
 
+/// "tag:x" → "tag": what kind of grouper a key belongs to.
+fn key_kind(key: &str) -> &str { key.split_once(':').map_or(key, |(k, _)| k) }
+
 impl ColourMemory {
+    /// Folder / Tag / File keys: a new key (in sorted order, so a fresh start
+    /// is deterministic) takes its hash slot, or the next free one.
     pub fn assign(&mut self, keys: &[String]) -> Vec<u8> {
+        self.assign_with(keys, true, &|k, _| hash_slot(k) as usize, &|k, _| hash_slot(k) as usize)
+    }
+
+    /// Component / Community keys (largest group first): a new key takes the
+    /// lowest free slot, cycling past PALETTE_LEN when every slot is taken.
+    pub fn assign_ranked(&mut self, keys: &[String]) -> Vec<u8> {
+        self.assign_with(keys, false, &|_, _| 0, &|_, i| i % PALETTE_LEN)
+    }
+
+    /// `start(key, index)`: where the search for a free slot begins; `full`:
+    /// the slot when none is free.
+    fn assign_with(&mut self, keys: &[String], sort_fresh: bool, start: &dyn Fn(&str, usize) -> usize, full: &dyn Fn(&str, usize) -> usize) -> Vec<u8> {
+        let n = PALETTE_LEN;
         let mut used = [false; PALETTE_LEN];
-        for k in keys { if let Some(&s) = self.slots.get(k) { used[s as usize % PALETTE_LEN] = true; } }
-        let mut fresh: Vec<&String> = keys.iter().filter(|k| !self.slots.contains_key(*k)).collect();
-        fresh.sort(); fresh.dedup();
-        for k in fresh {
-            let h = hash_slot(k) as usize;
-            let s = (0..PALETTE_LEN).map(|d| (h + d) % PALETTE_LEN).find(|&s| !used[s]).unwrap_or(h);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let first: Vec<usize> = (0..keys.len()).filter(|&i| seen.insert(keys[i].as_str())).collect();
+        // known keys first, the ones at their own hash slot ahead: a clash
+        // moves the later one
+        let mut known: Vec<usize> = first.iter().copied().filter(|&i| self.slots.contains_key(&keys[i])).collect();
+        let slot_of = |m: &BTreeMap<String, u8>, i: usize| m[&keys[i]] as usize % n;
+        known.sort_by_key(|&i| (slot_of(&self.slots, i) != hash_slot(&keys[i]) as usize, i));
+        let mut clashing = Vec::new();
+        for i in known {
+            let s = slot_of(&self.slots, i);
+            if used[s] { clashing.push(i); } else { used[s] = true; }
+        }
+        let free = |used: &[bool; PALETTE_LEN], from: usize| (0..n).map(|d| (from + d) % n).find(|&s| !used[s]);
+        for i in clashing {
+            // no free slot: keep the clash rather than repaint
+            if let Some(s) = free(&used, start(&keys[i], i)) { used[s] = true; self.slots.insert(keys[i].clone(), s as u8); }
+        }
+        let mut fresh: Vec<usize> = first.into_iter().filter(|&i| !self.slots.contains_key(&keys[i])).collect();
+        if sort_fresh { fresh.sort_by(|&a, &b| keys[a].cmp(&keys[b])); }
+        for i in fresh {
+            let s = free(&used, start(&keys[i], i)).unwrap_or_else(|| full(&keys[i], i) % n);
             used[s] = true;
-            self.slots.insert(k.clone(), s as u8);
+            self.slots.insert(keys[i].clone(), s as u8);
         }
         if self.slots.len() > MEMORY_CAP {
-            let keep: HashSet<&String> = keys.iter().collect();
-            self.slots.retain(|k, _| keep.contains(k));
+            // forget only this grouper's keys that are gone: the others'
+            // (tags while the file grouper is on) keep their colours
+            let keep: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            let kinds: HashSet<&str> = keys.iter().map(|k| key_kind(k)).collect();
+            self.slots.retain(|k, _| keep.contains(k.as_str()) || !kinds.contains(key_kind(k)));
         }
         keys.iter().map(|k| self.slots[k] % PALETTE_LEN as u8).collect()
     }
@@ -248,11 +292,13 @@ pub struct Group {
     pub pull:    bool,
     #[serde(default)]
     pub hull:    bool,
+    #[serde(flatten)]
+    pub extra:   BTreeMap<String, serde_json::Value>, // keys this navi doesn't know (a newer one's): kept as they are
 }
 
 impl Group {
     pub fn new(name: &str, query: &str) -> Self {
-        Group { name: name.into(), query: query.into(), colour: None, visible: true, pull: false, hull: false }
+        Group { name: name.into(), query: query.into(), colour: None, visible: true, pull: false, hull: false, extra: BTreeMap::new() }
     }
 }
 
@@ -462,6 +508,7 @@ fn auto_tag(g: &Graph, eligible: &[bool]) -> AutoSet {
 }
 
 /// One group per partition class with ≥ 2 eligible members, largest first.
+/// Component / Community pass eligible = visible and not an orphan.
 /// Keyed by a MEMBER, never by rank: "<kind>:<hub node id>" (resolve may
 /// keep an older member key, see `partition_keys`), so a hidden component
 /// or community stays the same cluster when sizes reorder.
@@ -482,21 +529,20 @@ fn from_partition(g: &Graph, eligible: &[bool], class: &[Option<usize>], kind: &
 }
 
 /// Connected components of the pre-hiding view, orphans excluded.
-fn auto_component(g: &Graph, pre: &ViewState) -> AutoSet {
+fn auto_component(g: &Graph, linked: &[bool]) -> AutoSet {
     let n = g.node_list.len();
-    let ok = |i: usize| pre.visible[i] && !pre.orphan[i];
     let mut comp = vec![None; n];
     let mut k = 0;
     for s in 0..n {
-        if !ok(s) || comp[s].is_some() { continue; }
+        if !linked[s] || comp[s].is_some() { continue; }
         comp[s] = Some(k);
         let mut stack = vec![s];
         while let Some(cur) = stack.pop() {
-            for &nb in &g.adj[cur] { if ok(nb) && comp[nb].is_none() { comp[nb] = Some(k); stack.push(nb); } }
+            for &nb in &g.adj[cur] { if linked[nb] && comp[nb].is_none() { comp[nb] = Some(k); stack.push(nb); } }
         }
         k += 1;
     }
-    from_partition(g, &pre.visible, &comp, "component")
+    from_partition(g, linked, &comp, "component")
 }
 
 /// File groups: a file node with its headings (containment via
@@ -637,27 +683,50 @@ type PrevPartition = (Vec<(u8, HashSet<String>)>, Vec<String>);
 
 #[derive(Default)]
 pub struct Grouping {
-    pub memory:    ColourMemory,
-    prev:          HashMap<&'static str, PrevPartition>,
+    pub memory:    ColourMemory,                          // the db's slots per auto-group key (views.json)
+    prev:          HashMap<&'static str, PrevPartition>,  // the last fresh partition per kind, this view
     pub community: CommunityCache,
 }
 
+/// `"<kind>:<id>"` → id.
+fn anchor<'k>(kind: &str, key: &'k str) -> Option<&'k str> { key.strip_prefix(kind)?.strip_prefix(':') }
+
+/// The keys among `keys` that name a member, by that member's id.
+fn by_anchor<'k>(kind: &str, keys: impl Iterator<Item = &'k String>) -> HashMap<&'k str, &'k String> {
+    keys.filter_map(|k| anchor(kind, k).map(|a| (a, k))).collect()
+}
+
+/// Of `index`'s keys, the first (sorted) naming a member of `set`.
+fn first_in(set: &HashSet<String>, index: &HashMap<&str, &String>) -> Option<String> {
+    if index.is_empty() { return None; }
+    set.iter().filter_map(|id| index.get(id.as_str())).min().map(|k| (*k).clone())
+}
+
 /// Keys for a new partition's groups ("<kind>:<member id>"), in order of
-/// preference: the key of the old group it inherited its colour from, while
-/// that member is still in it; else a hidden key (`hidden`, sorted) naming
-/// one of its members, so hiding survives a restart; else its hub's
+/// preference: a hidden key naming one of its members (so hiding never
+/// depends on what was computed before: a restart, or another view in
+/// between); else the key of the old group it inherited from, while that
+/// member is still in it; else a remembered key (`known`, with a colour)
+/// naming a member, so a restart finds the same key; else its hub's
 /// (`fallback`). Every key names a member and classes are disjoint, so keys
 /// are unique.
-fn partition_keys(kind: &str, sets: &[HashSet<String>], inherited: &[Option<&String>], hidden: &[&str], fallback: &[String]) -> Vec<String> {
-    let anchor = |key: &str| key.strip_prefix(kind).and_then(|r| r.strip_prefix(':')).map(str::to_string);
+fn partition_keys<'k>(kind: &str, sets: &[HashSet<String>], inherited: &[Option<&String>],
+                      hidden: impl Iterator<Item = &'k String>, known: impl Iterator<Item = &'k String>, fallback: &[String]) -> Vec<String> {
+    let hidden = by_anchor(kind, hidden);
+    let known  = by_anchor(kind, known);
     sets.iter().enumerate().map(|(k, set)| {
-        let old = inherited[k].filter(|key| anchor(key).is_some_and(|a| set.contains(&a))).cloned();
-        old.or_else(|| hidden.iter().find(|key| anchor(key).is_some_and(|a| set.contains(&a))).map(|key| key.to_string()))
+        first_in(set, &hidden)
+            .or_else(|| inherited[k].filter(|key| anchor(kind, key).is_some_and(|a| set.contains(a))).cloned())
+            .or_else(|| first_in(set, &known))
             .unwrap_or_else(|| fallback[k].clone())
     }).collect()
 }
 
 impl Grouping {
+    /// Another view is shown: its partitions start from the remembered keys,
+    /// not from the last view's (which another filter shaped).
+    pub fn forget_partitions(&mut self) { self.prev.clear(); }
+
     /// The grouped view: evaluate groups on the view without group hiding,
     /// hide nodes whose every group is hidden, classify orphans, filter.
     pub fn compute(&mut self, g: &Graph, filter: &ViewFilter, spec: &GroupSpec) -> (ViewState, GroupResolution) {
@@ -677,6 +746,7 @@ impl Grouping {
         let n = g.node_list.len();
         if pre.visible.len() != n { return GroupResolution::default(); }
         let eligible = &pre.visible;
+        let linked: Vec<bool> = (0..n).map(|i| pre.visible[i] && !pre.orphan[i]).collect();
         let cx = EvalCtx::from_view(g, pre);
 
         // manual groups (a spec built by hand may not have compiled them)
@@ -688,9 +758,8 @@ impl Grouping {
         let mut groups: Vec<GroupInfo> = Vec::new();
         let mut members: Vec<Vec<GroupId>> = vec![Vec::new(); n];
         for (gi, (grp, q)) in spec.manual.iter().zip(compiled).enumerate() {
-            let colour = grp.colour.map_or(GroupColour::Slot(hash_slot(&format!("manual:{}", grp.name))), GroupColour::Rgb);
             groups.push(GroupInfo {
-                key: format!("manual:{}", grp.name), label: grp.name.clone(), colour, manual: true,
+                key: manual_key(grp), label: grp.name.clone(), colour: manual_colour(grp), manual: true,
                 visible: grp.visible, pull: grp.pull, hull: grp.hull, members: 0, shown: 0,
                 error: q.as_ref().err().cloned(),
             });
@@ -705,7 +774,7 @@ impl Grouping {
             AutoGrouper::None              => AutoSet::with_nodes(n),
             AutoGrouper::Folder { depth }  => auto_folder(g, eligible, depth),
             AutoGrouper::Tag               => auto_tag(g, eligible),
-            AutoGrouper::Component         => auto_component(g, pre),
+            AutoGrouper::Component         => auto_component(g, &linked),
             AutoGrouper::File              => auto_file(g, eligible),
             AutoGrouper::Community { resolution, scope } => {
                 let edges: Vec<(usize, usize)> = match scope {
@@ -715,8 +784,10 @@ impl Grouping {
                 let key = edges_key(n, &edges, resolution, scope);
                 let ids = Arc::new(g.node_list.iter().map(|nd| nd.id.clone()).collect::<Vec<String>>());
                 match self.community.get(CommunityJob { key, n, edges, resolution, ids }) {
-                    Communities::Fresh(p) => from_partition(g, eligible, &p, "community"),
-                    Communities::Stale(p) => { fresh = false; from_partition(g, eligible, &p, "community") }
+                    // computed on every link (scope All) or not, an orphan of
+                    // this view is in no community, as in no component
+                    Communities::Fresh(p) => from_partition(g, &linked, &p, "community"),
+                    Communities::Stale(p) => { fresh = false; from_partition(g, &linked, &p, "community") }
                     Communities::Pending  => { fresh = false; AutoSet::with_nodes(n) } // first run still computing
                 }
             }
@@ -731,12 +802,11 @@ impl Grouping {
                 let matched = match_partition_with(prev, &ids);
                 let sets: Vec<HashSet<String>> = ids.into_iter().map(|v| v.into_iter().collect()).collect();
                 let inherited: Vec<Option<&String>> = matched.iter().map(|&(_, j)| j.and_then(|j| prev_keys.get(j))).collect();
-                let mut hidden: Vec<&str> = spec.auto_hidden.iter().map(String::as_str).collect();
-                hidden.sort_unstable();
-                auto.keys = partition_keys(kind, &sets, &inherited, &hidden, &auto.keys);
-                let slots: Vec<u8> = matched.iter().map(|&(s, _)| s).collect();
-                // only a fresh partition becomes the reference (a stale or
-                // empty stand-in would wipe the colour history)
+                auto.keys = partition_keys(kind, &sets, &inherited, spec.auto_hidden.iter(), self.memory.slots.keys(), &auto.keys);
+                // the slot is the key's, remembered with the view's db
+                let slots = self.memory.assign_ranked(&auto.keys);
+                // only a fresh partition becomes the reference for key
+                // inheritance (a stale stand-in would replace a newer one)
                 if fresh { self.prev.insert(kind, (slots.iter().copied().zip(sets).collect(), auto.keys.clone())); }
                 slots
             }
@@ -760,6 +830,28 @@ impl Grouping {
             hidden[i]  = !members[i].is_empty() && primary[i].is_none();
         }
         GroupResolution { groups, primary, members, hidden }
+    }
+}
+
+fn manual_key(g: &Group) -> String { format!("manual:{}", g.name) }
+
+/// A manual group's colour: its own, else a palette slot from its name.
+fn manual_colour(g: &Group) -> GroupColour { g.colour.map_or(GroupColour::Slot(hash_slot(&manual_key(g))), GroupColour::Rgb) }
+
+impl GroupResolution {
+    /// A manual group's colour or name changed and nothing else: patch the
+    /// key, label and colour in place. Membership, hiding and pull don't
+    /// depend on either, so dragging a colour or typing a name never
+    /// re-resolves the groups. `manual` must be the list this was resolved
+    /// from, in order; false (nothing patched) when it isn't.
+    pub fn restyle_manual(&mut self, manual: &[Group]) -> bool {
+        if self.groups.iter().filter(|g| g.manual).count() != manual.len() { return false; }
+        for (info, g) in self.groups.iter_mut().filter(|g| g.manual).zip(manual) {
+            info.key    = manual_key(g);
+            info.label  = g.name.clone();
+            info.colour = manual_colour(g);
+        }
+        true
     }
 }
 
@@ -1166,6 +1258,153 @@ mod tests {
         let (v, _) = grouping.compute(&g, &ViewFilter { dailies: DailiesMode::Hide, ..shown.clone() }, &spec);
         assert!(!v.visible[id(&g, "x")], "x y z stay hidden");
         assert!(v.visible[id(&g, "a")] && v.visible[id(&g, "b")], "a b stay shown");
+    }
+
+    /// Communities are computed on every link (scope All), yet two notes
+    /// linked only to a hidden daily are orphans in the view: no community
+    /// colour, hull or pull for them, as for components.
+    #[test]
+    fn community_grouper_leaves_orphans_out() {
+        let g = Graph::new(vec![
+            node("x", "X", "/n/x.org", &[]), node("z", "Z", "/n/z.org", &[]),
+            node("d", "2026-01-01", "/n/daily/d.org", &[]),
+            node("p", "P", "/n/p.org", &[]), node("q", "Q", "/n/q.org", &[]), node("r", "R", "/n/r.org", &[]),
+        ], vec![e("x", "d"), e("z", "d"), e("p", "q"), e("q", "r"), e("r", "p")]);
+        let mut spec = GroupSpec::new(vec![], AutoGrouper::Community { resolution: 1.0, scope: CommunityScope::All });
+        spec.auto_pull = true;
+        spec.auto_hull = true;
+        let hide = ViewFilter { dailies: DailiesMode::Hide, dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        let (v, res) = run(&g, &spec, &hide);
+        let (x, z) = (id(&g, "x"), id(&g, "z"));
+        assert!(v.visible[x] && v.orphan[x] && v.orphan[z]);
+        assert!(res.members[x].is_empty() && res.members[z].is_empty(), "orphans: the theme colour");
+        assert_eq!(res.pull_lists(&v.visible), vec![vec![id(&g, "p"), id(&g, "q"), id(&g, "r")]], "nothing pulls x and z together");
+        // dailies shown: linked through d, one community again
+        let shown = ViewFilter { dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        let (_, res) = run(&g, &spec, &shown);
+        assert!(!res.members[x].is_empty() && res.members[x] == res.members[z]);
+    }
+
+    /// Two remembered keys on one slot (each first seen while the other was
+    /// absent) get two colours once they show together; the one at its hash
+    /// slot keeps it, and the memory remembers the move.
+    #[test]
+    fn colour_memory_tells_remembered_clashes_apart() {
+        let a = "tag:a".to_string();
+        let b = (0..).map(|i| format!("tag:b{i}")).find(|k| hash_slot(k) == hash_slot(&a)).unwrap();
+        let mut m = ColourMemory::default();
+        assert_eq!(m.assign(std::slice::from_ref(&a)), vec![hash_slot(&a)]);
+        assert_eq!(m.assign(std::slice::from_ref(&b)), vec![hash_slot(&a)], "alone: its own hash slot");
+        let both = m.assign(&[a.clone(), b.clone()]);
+        assert_ne!(both[0], both[1], "shown together: two colours");
+        assert_eq!(both[0], hash_slot(&a), "the first keeps the slot");
+        assert_eq!(m.assign(&[b.clone(), a.clone()]), vec![both[1], both[0]], "remembered");
+        // a full palette: a clash is kept, nothing is repainted
+        let mut full = ColourMemory::default();
+        let many: Vec<String> = (0..PALETTE_LEN + 3).map(|i| format!("tag:m{i}")).collect();
+        let s1 = full.assign(&many);
+        assert_eq!(full.assign(&many), s1);
+    }
+
+    /// One memory per db: a view that saw `rust` first and one that saw both
+    /// at once agree, because they are the same memory (views.rs keeps it on
+    /// the db). Arrival order inside it is settled once.
+    #[test]
+    fn a_shared_memory_gives_every_view_the_same_colours() {
+        let a = "tag:a".to_string();
+        let b = (0..).map(|i| format!("tag:b{i}")).find(|k| hash_slot(k) == hash_slot(&a)).unwrap();
+        let mut db = ColourMemory::default();
+        let first  = db.assign(std::slice::from_ref(&b));               // view 1: only b
+        let second = db.assign(&[a.clone(), b.clone()]);    // view 2: both
+        assert_eq!(second[1], first[0], "b keeps its colour in the other view");
+        assert_ne!(second[0], second[1]);
+    }
+
+    /// Past MEMORY_CAP keys, only the current grouper's stale keys go: the
+    /// file grouper on a big db never wipes the tag colours.
+    #[test]
+    fn colour_memory_cap_keeps_other_groupers_keys() {
+        let a = "tag:a".to_string();
+        let b = (0..).map(|i| format!("tag:b{i}")).find(|k| hash_slot(k) == hash_slot(&a)).unwrap();
+        let mut m = ColourMemory::default();
+        m.assign(std::slice::from_ref(&b));
+        let tags = m.assign(&[a.clone(), b.clone()]);
+        let files: Vec<String> = (0..600).map(|i| format!("file:/n/f{i}.org")).collect();
+        m.assign(&files);
+        assert!(m.slots.contains_key(&a) && m.slots.contains_key(&b), "tag keys survive the cap");
+        assert_eq!(m.assign(&[a.clone(), b.clone()]), tags, "same colours after the file grouper");
+        let fewer: Vec<String> = files[..10].to_vec();
+        m.assign(&fewer);
+        assert!(m.slots.len() <= MEMORY_CAP, "stale file keys are dropped: {}", m.slots.len());
+        assert!(m.slots.contains_key(&a));
+    }
+
+    /// The hidden cluster stays hidden after another view (other filters,
+    /// same grouper) gave it a different member's key: a hidden key naming a
+    /// member wins over the inherited one.
+    #[test]
+    fn a_hidden_component_stays_hidden_after_another_view() {
+        let g = Graph::new(vec![
+            node("h", "H", "/n/h.org", &[]), node("j", "J", "/n/j.org", &[]), node("k", "K", "/n/k.org", &[]), node("m", "M", "/n/m.org", &[]),
+            node("u1", "U1", "/n/u1.org", &[]), node("u2", "U2", "/n/u2.org", &[]),
+            node("d", "2026-01-01", "/n/daily/d.org", &[]),
+        ], vec![e("j", "h"), e("j", "k"), e("j", "m"), e("h", "k"), e("u1", "u2"), e("d", "j"), e("d", "u1")]);
+        let shown = ViewFilter { dailies_dirs: vec!["daily".into()], ..ViewFilter::default() };
+        let hide  = ViewFilter { dailies: DailiesMode::Hide, ..shown.clone() };
+        let view_a = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut view_b = GroupSpec::new(vec![], AutoGrouper::Component);
+        view_b.auto_hidden.insert("component:h".into());
+        let (v, _) = Grouping::default().compute(&g, &hide, &view_b);
+        assert!(!v.visible[id(&g, "h")], "straight into B");
+        let mut gr = Grouping::default();
+        let (_, ra) = gr.compute(&g, &shown, &view_a);
+        assert_eq!(ra.groups[0].key, "component:j", "A names the merged cluster after j");
+        let (v, _) = gr.compute(&g, &hide, &view_b);
+        for s in ["h", "j", "k", "m"] { assert!(!v.visible[id(&g, s)], "{s} stays hidden after A"); }
+        assert!(v.visible[id(&g, "u1")]);
+    }
+
+    /// Partition colours live in the memory by member key: a restart (fresh
+    /// Grouping, the db's memory read back) and an empty interim read keep
+    /// them, where the size rank alone would swap them.
+    #[test]
+    fn component_colours_survive_a_restart_and_an_empty_read() {
+        let spec = GroupSpec::new(vec![], AutoGrouper::Component);
+        let mut w = Grouping::default();
+        let g1 = chains(3, 2);
+        let (_, r1) = w.compute(&g1, &ViewFilter::default(), &spec);
+        let g2 = chains(3, 5);
+        let (_, r2) = w.compute(&g2, &ViewFilter::default(), &spec);
+        let before = (colour_of(&g1, &r1, "a0"), colour_of(&g1, &r1, "b0"));
+        assert_eq!((colour_of(&g2, &r2, "a0"), colour_of(&g2, &r2, "b0")), before, "while running");
+        // relaunch: only the memory (views.json) comes back
+        let mut fresh = Grouping { memory: w.memory.clone(), ..Grouping::default() };
+        let (_, r3) = fresh.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!((colour_of(&g2, &r3, "a0"), colour_of(&g2, &r3, "b0")), before, "after a restart");
+        // an empty read (org-roam rebuilding its db), then the real one
+        w.compute(&chains(0, 0), &ViewFilter::default(), &spec);
+        let (_, r4) = w.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!((colour_of(&g2, &r4, "a0"), colour_of(&g2, &r4, "b0")), before, "after an empty read");
+        // another view in between (partitions forgotten): the same again
+        w.forget_partitions();
+        let (_, r5) = w.compute(&g2, &ViewFilter::default(), &spec);
+        assert_eq!((colour_of(&g2, &r5, "a0"), colour_of(&g2, &r5, "b0")), before, "after a view switch");
+    }
+
+    /// A colour or name edit patches the resolution in place, the same as a
+    /// full recompute would give.
+    #[test]
+    fn restyling_a_manual_group_matches_a_recompute() {
+        let g = fixture();
+        let mut groups = vec![Group::new("Blog", "tag:blog"), Group::new("Rust", "tag:rust")];
+        let mut grouping = Grouping::default();
+        let (_, mut res) = grouping.compute(&g, &ViewFilter::default(), &GroupSpec::new(groups.clone(), AutoGrouper::Tag));
+        groups[0].colour = Some([1, 2, 3]);
+        groups[1].name = "Crab".into();
+        assert!(res.restyle_manual(&groups));
+        let (_, full) = grouping.compute(&g, &ViewFilter::default(), &GroupSpec::new(groups.clone(), AutoGrouper::Tag));
+        assert_eq!(res, full);
+        assert!(!res.restyle_manual(&groups[..1]), "a different list: not patched");
     }
 
     /// Three cliques joined in a ring by single links; `sizes` per clique.

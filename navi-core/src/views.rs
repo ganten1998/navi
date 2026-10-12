@@ -14,13 +14,20 @@
 //!
 //! Loading is tolerant, as config.json is: a bad db entry, view, group or
 //! value is dropped (to its default) on its own and the rest is kept; bytes
-//! that aren't UTF-8 are read as U+FFFD. When anything was dropped or
-//! replaced, or the file isn't JSON at all, the original is copied to
+//! that aren't UTF-8 are read as U+FFFD. Keys navi doesn't know (a newer
+//! navi's, or a hand edit's) are kept and written back as they were. When
+//! anything was dropped or replaced, the file isn't JSON at all, or a newer
+//! navi wrote it (`version` above this one's), the original is copied to
 //! `views.json.bad` before navi ever writes over it. A views.json that
 //! exists but can't be read at all (permissions, an I/O error) is never
 //! written over in that session. Saves are atomic (temp file + rename) and
 //! re-read the file first: every db but this session's own keeps what is on
 //! disk, so two navi windows on different dbs don't undo each other.
+//!
+//! Auto-group colours (`auto_colours`, a palette slot per key) belong to the
+//! db, not a view, so a tag has one colour in every view; per-view maps an
+//! earlier build wrote are merged into the db's on load (the active view's
+//! first).
 //!
 //! Migration: the first time a db has no views, its "Default" view takes the
 //! `dailies` / `orphans` / `links_to_dailies_count` an older config.json
@@ -36,6 +43,7 @@ use crate::groups::{AutoGrouper, Group, GroupSpec};
 use crate::view::{DailiesMode, OrphansMode, ViewFilter};
 
 pub const DEFAULT_PULL: f64 = 0.1;
+pub const VERSION: u64 = 1; // views.json format this navi writes
 
 fn yes() -> bool { true }
 fn default_pull() -> f64 { DEFAULT_PULL }
@@ -65,10 +73,12 @@ pub struct View {
     pub links_to_dailies_count: bool,
     #[serde(default = "default_pull")]
     pub group_pull:             f64,                        // centroid spring strength for pulling groups
-    #[serde(default, alias = "auto_colors")]
-    pub auto_colours:           BTreeMap<String, u8>,       // palette slot per auto-group key (stable colours)
+    #[serde(default, alias = "auto_colors", skip_serializing)]
+    pub auto_colours:           BTreeMap<String, u8>,       // legacy: read, then moved into the db's (DbViews)
     #[serde(default)]
     pub panel_open:             bool,                       // the side panel (backslash key) is open in this view
+    #[serde(flatten)]
+    pub extra:                  BTreeMap<String, serde_json::Value>, // keys this navi doesn't know: kept as they are
 }
 
 impl Default for View {
@@ -77,7 +87,7 @@ impl Default for View {
             name: default_name(), groups: Vec::new(), auto: AutoGrouper::None, auto_hidden: Vec::new(),
             auto_pull: false, auto_hull: false, colour_groups: false,
             dailies: DailiesMode::Show, orphans: OrphansMode::Show, links_to_dailies_count: true,
-            group_pull: DEFAULT_PULL, auto_colours: BTreeMap::new(), panel_open: false,
+            group_pull: DEFAULT_PULL, auto_colours: BTreeMap::new(), panel_open: false, extra: BTreeMap::new(),
         }
     }
 }
@@ -151,9 +161,13 @@ impl View {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DbViews {
     #[serde(default)]
-    pub active: String, // name of the active view
+    pub active:       String,                              // name of the active view
     #[serde(default)]
-    pub views:  Vec<View>,
+    pub views:        Vec<View>,
+    #[serde(default, alias = "auto_colors", skip_serializing_if = "BTreeMap::is_empty")]
+    pub auto_colours: BTreeMap<String, u8>,                // palette slot per auto-group key, every view's
+    #[serde(flatten)]
+    pub extra:        BTreeMap<String, serde_json::Value>, // keys this navi doesn't know: kept as they are
 }
 
 impl DbViews {
@@ -162,14 +176,25 @@ impl DbViews {
 
 #[derive(Serialize)]
 struct FileOut<'a> {
-    version: u32,
+    version: u64,
     dbs:     &'a BTreeMap<String, DbViews>,
+    #[serde(flatten)]
+    extra:   &'a serde_json::Map<String, serde_json::Value>,
+}
+
+/// What views.json held.
+#[derive(Debug, Clone, Default)]
+pub struct Parsed {
+    pub dbs:     BTreeMap<String, DbViews>,
+    pub extra:   serde_json::Map<String, serde_json::Value>, // top-level keys this navi doesn't know
+    pub dropped: bool,                                       // something was dropped: back the original up
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ViewStore {
     pub path:   PathBuf,
     pub dbs:    BTreeMap<String, DbViews>,
+    extra:      serde_json::Map<String, serde_json::Value>, // unknown top-level keys, written back
     owned:      BTreeSet<String>, // dbs this session edits; save() takes every other one from disk
     read_error: Option<String>,   // views.json exists but couldn't be read: never written over
 }
@@ -208,7 +233,7 @@ impl ViewStore {
     pub fn load(path: &Path) -> Self {
         let mut store = ViewStore { path: path.to_path_buf(), ..ViewStore::default() };
         match Self::read(path) {
-            Ok(dbs) => store.dbs = dbs.unwrap_or_default(),
+            Ok(p) => if let Some(p) = p { store.dbs = p.dbs; store.extra = p.extra; },
             Err(e)  => {
                 eprintln!("navi: couldn't read {}: {e}; views won't be saved this session", path.display());
                 store.read_error = Some(e.to_string());
@@ -220,7 +245,7 @@ impl ViewStore {
     /// Read and tolerantly parse `path`: None when it doesn't exist; an error
     /// only when it exists and can't be read. Dropped or non-UTF-8 content
     /// backs the original bytes up to `views.json.bad` first.
-    fn read(path: &Path) -> std::io::Result<Option<BTreeMap<String, DbViews>>> {
+    fn read(path: &Path) -> std::io::Result<Option<Parsed>> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -229,29 +254,50 @@ impl ViewStore {
         let text = String::from_utf8_lossy(&bytes);
         let lossy = matches!(text, std::borrow::Cow::Owned(_));
         if lossy { eprintln!("navi: views.json: not valid UTF-8, read with the bad bytes replaced"); }
-        let (dbs, dropped) = Self::parse(&text);
-        if dropped || lossy {
+        let parsed = Self::parse_file(&text);
+        if parsed.dropped || lossy {
             let bad = path.with_extension("json.bad");
             if std::fs::write(&bad, &bytes).is_ok() {
                 eprintln!("navi: views.json: the original is kept as {}", bad.display());
             }
         }
-        Ok(Some(dbs))
+        Ok(Some(parsed))
     }
 
     /// Parse views.json text. Returns the dbs and whether anything was
     /// dropped (including the whole file, when it isn't a JSON object).
     pub fn parse(text: &str) -> (BTreeMap<String, DbViews>, bool) {
+        let p = Self::parse_file(text);
+        (p.dbs, p.dropped)
+    }
+
+    /// `parse`, plus the top-level keys navi doesn't know. A file a newer
+    /// navi wrote counts as dropped (backed up): its keys are kept, but what
+    /// they mean may have changed.
+    pub fn parse_file(text: &str) -> Parsed {
         let mut out = BTreeMap::new();
-        let root = match serde_json::from_str::<serde_json::Value>(text) {
+        let mut root = match serde_json::from_str::<serde_json::Value>(text) {
             Ok(serde_json::Value::Object(o)) => o,
-            _ => { eprintln!("navi: views.json: not a JSON object, starting fresh"); return (out, true); }
+            _ => {
+                eprintln!("navi: views.json: not a JSON object, starting fresh");
+                return Parsed { dropped: true, ..Parsed::default() };
+            }
         };
         let mut dropped = false;
-        let dbs = match root.get("dbs") {
-            Some(serde_json::Value::Object(d)) => d.clone(),
-            Some(_) => { eprintln!("navi: views.json: \"dbs\" is not an object"); return (out, true); }
-            None => return (out, false),
+        match root.remove("version") {
+            Some(v) if v.as_u64().is_some_and(|v| v > VERSION) => {
+                eprintln!("navi: views.json: written by a newer navi (version {v}); everything is kept");
+                dropped = true;
+            }
+            _ => {}
+        }
+        let dbs = match root.remove("dbs") {
+            Some(serde_json::Value::Object(d)) => d,
+            Some(_) => {
+                eprintln!("navi: views.json: \"dbs\" is not an object");
+                return Parsed { dropped: true, extra: root, ..Parsed::default() };
+            }
+            None => return Parsed { dropped, extra: root, ..Parsed::default() },
         };
         for (key, entry) in dbs {
             let serde_json::Value::Object(mut entry) = entry else {
@@ -284,13 +330,27 @@ impl ViewStore {
                 let mut k = 2;
                 while !seen.insert(v.name.clone()) { v.name = format!("{base} {k}"); k += 1; }
             }
-            out.insert(key, DbViews { active, views });
+            let colours = entry.remove("auto_colours").or_else(|| entry.remove("auto_colors"));
+            let mut auto_colours: BTreeMap<String, u8> = match colours.map(serde_json::from_value) {
+                None         => BTreeMap::new(),
+                Some(Ok(m))  => m,
+                Some(Err(_)) => { eprintln!("navi: views.json: {key}: bad \"auto_colours\", ignored"); dropped = true; BTreeMap::new() }
+            };
+            // an earlier build kept them per view: the db's now (the active
+            // view's win, then the others in order)
+            let act = views.iter().position(|v| v.name == active).unwrap_or(0);
+            for i in std::iter::once(act).chain(0..views.len()) {
+                if let Some(v) = views.get_mut(i) {
+                    for (k, s) in std::mem::take(&mut v.auto_colours) { auto_colours.entry(k).or_insert(s); }
+                }
+            }
+            out.insert(key, DbViews { active, views, auto_colours, extra: entry.into_iter().collect() });
         }
-        (out, dropped)
+        Parsed { dbs: out, extra: root, dropped }
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(&FileOut { version: 1, dbs: &self.dbs }).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string_pretty(&FileOut { version: VERSION, dbs: &self.dbs, extra: &self.extra }).unwrap_or_else(|_| "{}".into())
     }
 
     /// Write views.json. Every db this session doesn't edit is first taken
@@ -300,10 +360,31 @@ impl ViewStore {
         if let Some(e) = &self.read_error {
             return Err(std::io::Error::other(format!("not written: it couldn't be read when navi started ({e})")));
         }
-        for (k, v) in Self::read(&self.path)?.unwrap_or_default() {
-            if !self.owned.contains(&k) { self.dbs.insert(k, v); }
+        if let Some(disk) = Self::read(&self.path)? {
+            for (k, v) in disk.dbs {
+                if !self.owned.contains(&k) { self.dbs.insert(k, v); }
+            }
+            for (k, v) in disk.extra { self.extra.entry(k).or_insert(v); }
         }
         atomic_write(&self.path, &self.to_json())
+    }
+
+    /// False when views.json couldn't be read at load: every save fails, so
+    /// retrying one is pointless.
+    pub fn writable(&self) -> bool { self.read_error.is_none() }
+
+    /// The db's auto-group colours (shared by its views).
+    pub fn auto_colours(&self, key: &str) -> BTreeMap<String, u8> {
+        self.dbs.get(key).map(|d| d.auto_colours.clone()).unwrap_or_default()
+    }
+
+    /// Replace the db's auto-group colours. True when they changed (save).
+    pub fn set_auto_colours(&mut self, key: &str, slots: &BTreeMap<String, u8>) -> bool {
+        self.owned.insert(key.to_string());
+        let db = self.dbs.entry(key.to_string()).or_default();
+        if db.auto_colours == *slots { return false; }
+        db.auto_colours = slots.clone();
+        true
     }
 
     /// Make sure `key` has at least one view. A db seen for the first time
@@ -430,7 +511,7 @@ mod tests {
         v.groups.push(rust);
         v.auto = AutoGrouper::Community { resolution: 1.5, scope: CommunityScope::Visible };
         v.orphans = OrphansMode::Only;
-        v.auto_colours.insert("tag:x".into(), 3);
+        assert!(s.set_auto_colours("/db/a.db", &BTreeMap::from([("tag:x".to_string(), 3)])));
         s.dbs.get_mut("/db/a.db").unwrap().views.push(View::named("Work"));
         assert!(s.set_active("/db/a.db", 1));
         assert!(!s.set_active("/db/a.db", 1));
@@ -492,6 +573,52 @@ mod tests {
         assert!(s.dbs.is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("views.json.bad")).unwrap(), "{ not json");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys this navi doesn't know (a newer navi's, a hand edit's) survive a
+    /// save; a file from a newer navi is backed up before it's written.
+    #[test]
+    fn unknown_keys_survive_a_save() {
+        let dir  = tmp("unknown");
+        let path = dir.join("views.json");
+        let text = r#"{ "version": 2, "future": [1, 2],
+            "dbs": { "/a.db": { "active": "V", "pinned": true, "views": [
+                { "name": "V", "physics": { "k": 3 },
+                  "groups": [ { "name": "G", "query": "tag:x", "note": "keep me" } ] } ] } } }"#;
+        std::fs::write(&path, text).unwrap();
+        let mut s = ViewStore::load(&path);
+        assert_eq!(std::fs::read_to_string(dir.join("views.json.bad")).unwrap(), text, "newer version: backed up");
+        s.active_mut("/a.db").panel_open = true;
+        s.save().unwrap();
+        let back: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["future"], serde_json::json!([1, 2]));
+        assert_eq!(back["dbs"]["/a.db"]["pinned"], serde_json::json!(true));
+        let v = &back["dbs"]["/a.db"]["views"][0];
+        assert_eq!(v["physics"]["k"], serde_json::json!(3));
+        assert_eq!(v["groups"][0]["note"], serde_json::json!("keep me"));
+        assert_eq!(v["panel_open"], serde_json::json!(true), "and the edit");
+        // this navi's own version: no backup for unknown keys alone (they're kept)
+        let _ = std::fs::remove_file(dir.join("views.json.bad"));
+        std::fs::write(&path, text.replace("\"version\": 2", "\"version\": 1")).unwrap();
+        ViewStore::load(&path);
+        assert!(!dir.join("views.json.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-view colour maps (an earlier build) become the db's, the active
+    /// view's first; they are written once, on the db.
+    #[test]
+    fn per_view_colours_move_to_the_db() {
+        let text = r#"{ "version": 1, "dbs": { "/a.db": { "active": "B", "views": [
+            { "name": "A", "auto_colours": { "tag:x": 1, "tag:y": 2 } },
+            { "name": "B", "auto_colours": { "tag:x": 5 } } ] } } }"#;
+        let (dbs, dropped) = ViewStore::parse(text);
+        assert!(!dropped);
+        let db = &dbs["/a.db"];
+        assert_eq!(db.auto_colours, BTreeMap::from([("tag:x".to_string(), 5), ("tag:y".to_string(), 2)]));
+        assert!(db.views.iter().all(|v| v.auto_colours.is_empty()));
+        let out = serde_json::to_string(db).unwrap();
+        assert_eq!(out.matches("auto_colours").count(), 1, "{out}");
     }
 
     /// Phase-1 config.json filters seed the first view, field by field.

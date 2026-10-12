@@ -372,3 +372,124 @@ fn search_falls_back_to_plain_text() {
     h.key(Key::Enter, Modifiers::NONE, None);
     assert_eq!(h.app.selected, Some(1), "Enter jumps to it");
 }
+
+/// A refused rename (empty or taken name) keeps the keyboard in the field:
+/// the next keys edit the name, never fire D or quit with Q.
+#[test]
+fn a_refused_rename_keeps_the_keyboard() {
+    let mut h = Harness::new("renamerefused", false);
+    h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+    h.app.apply_view_op(ViewOp::New);
+    h.app.panel.rename = Some("Default".into());
+    h.app.panel.rename_focus = true;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(text_field_focused(&h.ctx));
+    h.key(Key::Enter, Modifiers::NONE, None);
+    assert!(h.app.panel.rename_error.is_some(), "taken name refused");
+    h.frame(vec![]);
+    assert!(text_field_focused(&h.ctx), "the field has the keyboard again");
+    h.key(Key::D, Modifiers::NONE, Some("d"));
+    h.key(Key::Q, Modifiers::NONE, Some("q"));
+    assert_eq!(h.app.view_filter.dailies, DailiesMode::Show, "d typed, not toggled");
+    assert!(!h.app.quit_requested, "q typed, not quit");
+    assert_eq!(h.app.panel.rename.as_deref(), Some("Defaultdq"));
+}
+
+/// The active view's own key (or ] with one view) reloads nothing: physics
+/// stays asleep, Tree doesn't re-run, a pending prompt stays, nothing saves.
+#[test]
+fn the_active_views_key_reloads_nothing() {
+    let mut h = Harness::new("samekey", false);
+    settle(&mut h);
+    h.app.panel.confirm_delete = true;
+    h.app.views_dirty_at = None;
+    h.key(Key::Num1, Modifiers::NONE, Some("1"));
+    assert!(!h.app.graph.physics_on, "Disk: physics stays asleep");
+    assert!(h.app.panel.confirm_delete, "the prompt stays");
+    assert!(h.app.views_dirty_at.is_none(), "nothing to save");
+    h.app.panel.confirm_delete = false;
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    h.key(Key::V, Modifiers::NONE, Some("v"));
+    settle(&mut h);
+    h.key(Key::CloseBracket, Modifiers::NONE, Some("]"));
+    assert!(!h.app.graph.is_layout_animating(), "Tree doesn't re-run");
+    assert!(h.app.popup.as_ref().is_some_and(|(m, _)| m.contains("(1/1)")), "it still says where you are");
+}
+
+/// A save that fails stays pending and is written once it can be (here at
+/// exit), not dropped with the error.
+#[test]
+fn a_failed_save_is_retried() {
+    let mut h = Harness::new("saveretry", false);
+    let path = h.dir.join("views.json");
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(&path).unwrap(); // a directory where the file goes: every save fails
+    h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+    h.app.shutdown();
+    assert!(h.app.views_dirty_at.is_some(), "still pending after the failure");
+    std::fs::remove_dir_all(&path).unwrap();
+    h.app.shutdown();
+    assert!(h.app.views_dirty_at.is_none());
+    assert!(std::fs::read_to_string(&path).unwrap().contains("\"panel_open\": true"), "the edit reached views.json");
+}
+
+/// Dragging a group's colour (or typing its name) patches colours in place:
+/// no re-resolve per step, and the graph shows the new colour.
+#[test]
+fn a_colour_edit_does_not_recompute_the_view() {
+    let mut h = Harness::new("restyle", false);
+    h.app.active_view.groups.push(Group::new("AB", "Alpha OR Beta"));
+    h.app.active_view.colour_groups = true;
+    h.app.groups_changed();
+    h.frame(vec![]);
+    let gen = h.app.view_gen;
+    h.app.active_view.groups[0].colour = Some([1, 2, 3]);
+    h.app.active_view.groups[0].name = "Renamed".into();
+    h.app.apply_panel(PanelOut { group_style: true, ..PanelOut::default() });
+    h.frame(vec![]);
+    assert_eq!(h.app.view_gen, gen, "no recompute");
+    assert_eq!(h.app.node_colours[0], Some(Color32::from_rgb(1, 2, 3)), "the new colour is on the graph");
+    assert_eq!(h.app.groups.groups[0].label, "Renamed");
+    assert!(h.saved().contains("Renamed"), "and saved");
+}
+
+/// "Add group" from a search that only matched as plain text makes a group
+/// that parses and matches the same notes.
+#[test]
+fn add_group_from_a_plain_text_search_matches_the_same_notes() {
+    let mut h = Harness::new("addgroup", false);
+    h.app.graph.node_list[1].title = "Beta (draft".into();
+    h.app.last_search = "beta (draft".into();
+    panel::add_group(&mut h.app, [0, 0, 0]);
+    h.app.groups_changed();
+    let g = h.app.active_view.groups.last().expect("Add group clicked");
+    assert_eq!(g.query, "\"beta (draft\"");
+    let info = &h.app.groups.groups[h.app.active_view.groups.len() - 1];
+    assert!(info.error.is_none() && info.members == 1, "{info:?}");
+}
+
+/// The automatic groups list lays out only the rows in sight: hundreds of
+/// tags cost a screenful of widgets.
+#[test]
+fn a_long_auto_group_list_builds_only_visible_rows() {
+    let mut h = Harness::new("autolist", false);
+    let nodes: Vec<RawNode> = (0..400).map(|i| RawNode { tags: vec![format!("t{i:03}")], ..node(&format!("n{i}"), &format!("N{i}"), &format!("/n/n{i}.org")) }).collect();
+    h.app.graph = Graph::new(nodes, vec![]);
+    h.app.active_view.auto = AutoGrouper::Tag;
+    h.app.active_view.colour_groups = true;
+    h.app.groups_changed();
+    h.key(Key::Backslash, Modifiers::NONE, Some("\\"));
+    // open every collapsed header in the panel (the list starts closed past 12)
+    let mut opened = 0;
+    for w in h.panel_widgets() {
+        if let Some(mut st) = egui::collapsing_header::CollapsingState::load(&h.ctx, w.id) {
+            if !st.is_open() { st.set_open(true); st.store(&h.ctx); opened += 1; }
+        }
+    }
+    for _ in 0..3 { h.frame(vec![]); }
+    assert!(opened > 0, "the list was opened");
+    let n = h.panel_widgets().len();
+    assert_eq!(h.app.groups.groups.len(), 400);
+    assert!(n < 200, "{n} widgets for 400 groups");
+}
