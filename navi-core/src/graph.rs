@@ -13,6 +13,7 @@ pub const BASE_DT:   f64 = 1.0 / 60.0;
 pub const DT_CAP:    f64 = 0.05;
 pub const R_MIN:     f32 = 5.0;
 pub const R_MAX:     f32 = 22.0;
+pub const MAX_PULL:  f64 = 1.0;   // group pull ceiling (SPRING_K is 0.055; 0.1 is a soft drift, 0.5 tight clusters)
 
 const LAYOUT_DUR: f32 = 1.3; // seconds for layout transition animation
 
@@ -28,6 +29,8 @@ pub struct Node {
     pub tags:        Vec<String>,
     pub olp:         Vec<String>,
     pub parent_file: Option<usize>, // heading → its file node (containment: not an edge, not in degree)
+    pub properties:  Vec<(String, String)>,
+    pub dangling:    usize,         // unresolved links (fuzzy / missing id) whose source is this node
     pub x: f64, pub y: f64,
     pub vx: f64, pub vy: f64,
     pub pinned: bool,
@@ -49,7 +52,6 @@ pub struct Graph {
     pub adj:        Vec<Vec<usize>>,      // over `edges`
     pub dangling:   Vec<DanglingLink>,
     pub link_stats: LinkStats,
-    pub tag_colors: HashMap<String, [u8; 3]>,
     pub physics_on: bool,
     pub step_count: u64,
     // ── view: set by apply_view(); everything visible until then ──
@@ -59,6 +61,9 @@ pub struct Graph {
     pub vis_adj:    Vec<Vec<usize>>,      // over `vis_edges`
     vis_local:      Vec<(usize, usize)>,  // `vis_edges` as positions in `vis_idx`
     vis_layout:     Vec<(usize, usize)>,  // `vis_local` minus edges touching a view orphan (what layouts see)
+    local_of:       Vec<usize>,           // node index → position in `vis_idx` (usize::MAX = hidden)
+    pull_groups:    Vec<Vec<usize>>,      // group pull: member node indices per pulling group
+    pull_strength:  f64,                  // centroid spring constant; 0 = off
     clamp_r:        f64,                  // physics radial clamp; set by placements, never by filters
     layout_anim:    Option<LayoutAnim>,
     physics_ease:   f32, // 0 → 1 ramp after layout animation so forces fade in, not snap
@@ -115,6 +120,8 @@ impl Graph {
                 tags:        rn.tags,
                 olp:         rn.olp,
                 parent_file: rn.parent_file.as_ref().and_then(|p| nodes.get(p).copied()),
+                properties:  rn.properties,
+                dangling:    0,
                 x: 0.0, y: 0.0,
                 vx: lcg_uniform(i as u64 * 2 + 3) * 4.0 - 2.0,
                 vy: lcg_uniform(i as u64 * 2 + 4) * 4.0 - 2.0,
@@ -155,20 +162,12 @@ impl Graph {
             nd.radius = R_MIN + (R_MAX - R_MIN) * (nd.degree as f32 + 1.0).ln_1p() / log_span;
         }
 
-        let mut all_tags: Vec<String> = node_list.iter().flat_map(|n| n.tags.iter().cloned()).collect();
-        all_tags.sort(); all_tags.dedup();
-        let phi = 0.618033988749895f64;
-        let mut tag_colors: HashMap<String, [u8; 3]> = HashMap::new();
-        for (i, tag) in all_tags.iter().enumerate() {
-            let h = (i as f64 * phi) % 1.0;
-            tag_colors.insert(tag.clone(), hsv_to_rgb(h, 0.62, 0.88));
-        }
-
         let mut g = Graph {
             nodes, node_list, edges, adj, dangling: Vec::new(), link_stats: LinkStats::default(),
-            tag_colors, physics_on: true, step_count: 0,
+            physics_on: true, step_count: 0,
             visible: Vec::new(), vis_idx: Vec::new(), vis_edges: Vec::new(), vis_adj: Vec::new(),
-            vis_local: Vec::new(), vis_layout: Vec::new(), clamp_r: base_clamp(n),
+            vis_local: Vec::new(), vis_layout: Vec::new(), local_of: Vec::new(),
+            pull_groups: Vec::new(), pull_strength: 0.0, clamp_r: base_clamp(n),
             layout_anim: None, physics_ease: 1.0, settle_frames: 0,
         };
         g.set_visible(vec![true; n], None);
@@ -179,8 +178,7 @@ impl Graph {
     pub fn from_data(data: GraphData) -> Self {
         let (dangling, stats) = (data.dangling, data.stats);
         let mut g = Graph::new(data.nodes, data.edges);
-        g.dangling   = dangling;
-        g.link_stats = stats;
+        g.set_dangling(dangling, stats);
         g
     }
 
@@ -188,9 +186,18 @@ impl Graph {
     pub fn from_data_with_view(data: GraphData, filter: &ViewFilter) -> Self {
         let (dangling, stats) = (data.dangling, data.stats);
         let mut g = Graph::new_with_view(data.nodes, data.edges, filter);
-        g.dangling   = dangling;
-        g.link_stats = stats;
+        g.set_dangling(dangling, stats);
         g
+    }
+
+    /// Keep the db's dangling links and count them per source node.
+    pub fn set_dangling(&mut self, dangling: Vec<DanglingLink>, stats: LinkStats) {
+        for nd in self.node_list.iter_mut() { nd.dangling = 0; }
+        for d in &dangling {
+            if let Some(&i) = self.nodes.get(&d.source) { self.node_list[i].dangling += 1; }
+        }
+        self.dangling   = dangling;
+        self.link_stats = stats;
     }
 
     /// Put every node at `pos` (a full placement) and size the physics clamp
@@ -232,6 +239,7 @@ impl Graph {
         };
         self.vis_adj   = vec![Vec::new(); n];
         for &(a, b) in &self.vis_edges { self.vis_adj[a].push(b); self.vis_adj[b].push(a); }
+        self.local_of  = local;
         for (nd, &v) in self.node_list.iter_mut().zip(&visible) {
             if !v { nd.vx = 0.0; nd.vy = 0.0; nd.pinned = false; }
         }
@@ -239,6 +247,52 @@ impl Graph {
     }
 
     pub fn is_visible(&self, i: usize) -> bool { self.visible.get(i).copied().unwrap_or(false) }
+
+    // ── Group pull ────────────────────────────────────────────────────────────
+
+    /// Soft clustering: every visible member of each list is drawn toward the
+    /// centroid of that list's VISIBLE members (no fixed anchor, so the whole
+    /// group still drifts with the rest of the graph). The pulls inside one
+    /// group sum to zero, so they add no net motion and the auto-pause still
+    /// settles. A node in several pulling groups splits the strength between
+    /// them. Hidden members are skipped every step (frozen, as ever); the
+    /// clamp is untouched. Changing the pull eases forces back in.
+    pub fn set_group_pull(&mut self, groups: Vec<Vec<usize>>, strength: f64) {
+        let strength = if strength.is_finite() { strength.clamp(0.0, MAX_PULL) } else { 0.0 };
+        let groups: Vec<Vec<usize>> = groups.into_iter()
+            .map(|g| g.into_iter().filter(|&i| i < self.node_list.len()).collect::<Vec<usize>>())
+            .filter(|g| g.len() >= 2).collect();
+        let off = |g: &Graph| g.pull_strength == 0.0 || g.pull_groups.is_empty();
+        let was_off = off(self);
+        let changed = groups != self.pull_groups || strength != self.pull_strength;
+        self.pull_groups   = groups;
+        self.pull_strength = strength;
+        if changed && !(was_off && off(self)) { self.resume_physics(); }
+    }
+
+    pub fn group_pull_active(&self) -> bool { self.pull_strength > 0.0 && !self.pull_groups.is_empty() }
+
+    /// Add the group pull to the forces of a step (local indices).
+    fn add_group_pull(&self, pts: &[(f64, f64)], fx: &mut [f64], fy: &mut [f64]) {
+        if !self.group_pull_active() { return; }
+        let mut share = vec![0u32; pts.len()];
+        let local = |i: usize| self.local_of.get(i).copied().filter(|&l| l != usize::MAX);
+        for grp in &self.pull_groups { for &i in grp { if let Some(l) = local(i) { share[l] += 1; } } }
+        let mut mem: Vec<usize> = Vec::new();
+        for grp in &self.pull_groups {
+            mem.clear();
+            mem.extend(grp.iter().filter_map(|&i| local(i)));
+            if mem.len() < 2 { continue; }
+            let c  = mem.len() as f64;
+            let (cx, cy) = mem.iter().fold((0.0, 0.0), |(x, y), &l| (x + pts[l].0, y + pts[l].1));
+            let (cx, cy) = (cx / c, cy / c);
+            for &l in &mem {
+                let s = self.pull_strength / share[l] as f64;
+                fx[l] += (cx - pts[l].0) * s;
+                fy[l] += (cy - pts[l].1) * s;
+            }
+        }
+    }
 
     /// Nodes within `hops` of `start` over VISIBLE edges (a hidden daily never
     /// bridges two notes), as a per-node mask.
@@ -384,6 +438,7 @@ impl Graph {
             fx[si] += dx * f; fy[si] += dy * f;
             fx[di] -= dx * f; fy[di] -= dy * f;
         }
+        self.add_group_pull(&pts, &mut fx, &mut fy);
 
         self.step_count = self.step_count.wrapping_add(1);
         let t    = self.step_count as f64 * 0.006;
@@ -1053,15 +1108,6 @@ fn lcg_uniform(seed: u64) -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
-fn hsv_to_rgb(h: f64, s: f64, v: f64) -> [u8; 3] {
-    let i = (h * 6.0) as u32;
-    let f = h * 6.0 - i as f64;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - f * s);
-    let t = v * (1.0 - (1.0 - f) * s);
-    let (r, g, b) = match i % 6 { 0=>(v,t,p), 1=>(q,v,p), 2=>(p,v,t), 3=>(p,q,v), 4=>(t,p,v), _=>(v,p,q) };
-    [(r*255.0) as u8, (g*255.0) as u8, (b*255.0) as u8]
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

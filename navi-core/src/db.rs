@@ -13,6 +13,7 @@ pub struct RawNode {
     pub tags:        Vec<String>,
     pub olp:         Vec<String>,    // outline path of a heading node (empty for file nodes)
     pub parent_file: Option<String>, // heading node → id of its file's level-0 node (containment, NOT a link)
+    pub properties:  Vec<(String, String)>, // org property drawer (+ CATEGORY, FILE, …) from `nodes.properties`
 }
 
 /// A link that names something which is not a node: an `id:` link whose
@@ -130,6 +131,19 @@ pub fn load_graph_from(conn: &Connection) -> rusqlite::Result<GraphData> {
             for (id, olp) in iter.flatten() {
                 if let (Some(n), Some(olp)) = (nodes.get_mut(&unquote(&id)), olp) {
                     n.olp = parse_lisp_strings(&olp);
+                }
+            }
+        }
+    }
+
+    // Properties — a printed alist per node; optional like olp.
+    if let Ok(mut stmt) = conn.prepare("SELECT id, properties FROM nodes") {
+        if let Ok(iter) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        }) {
+            for (id, props) in iter.flatten() {
+                if let (Some(n), Some(p)) = (nodes.get_mut(&unquote(&id)), props) {
+                    n.properties = parse_lisp_alist(&p);
                 }
             }
         }
@@ -303,6 +317,54 @@ pub fn parse_lisp_strings(s: &str) -> Vec<String> {
     out
 }
 
+/// A printed alist of string pairs: `(("KEY" . "VAL") ("K2" . nil))` →
+/// [(KEY, VAL), (K2, nil)]. Anything that isn't a `("key" . value)` cons is
+/// skipped; `nil`, empty or garbage → empty. Cheap: one pass, no allocation
+/// per character beyond the strings themselves.
+pub fn parse_lisp_alist(s: &str) -> Vec<(String, String)> {
+    #[derive(PartialEq)]
+    enum T { Open, Close, Dot, Str(String), Atom(String) }
+    let mut toks  = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => toks.push(T::Open),
+            ')' => toks.push(T::Close),
+            '"' => {
+                let mut cur = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => if let Some(n) = chars.next() { cur.push(n) },
+                        '"'  => break,
+                        _    => cur.push(c),
+                    }
+                }
+                toks.push(T::Str(cur));
+            }
+            c if c.is_whitespace() => {}
+            c => {
+                let mut cur = String::from(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_whitespace() || n == '(' || n == ')' || n == '"' { break; }
+                    cur.push(n); chars.next();
+                }
+                toks.push(if cur == "." { T::Dot } else { T::Atom(cur) });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 < toks.len() {
+        if let [T::Open, T::Str(k), T::Dot, T::Str(v) | T::Atom(v), T::Close] = &toks[i..i + 5] {
+            out.push((k.clone(), v.clone()));
+            i += 5;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Parse Emacs mtime which may be:
 ///   - A plain integer string "1779015285"
 ///   - Emacs internal time "(HIGH LOW MICROSEC PICOSEC)" → HIGH*65536 + LOW
@@ -389,6 +451,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lisp_alists() {
+        let p = parse_lisp_alist(r#"(("CATEGORY" . "x y") ("ID" . "A-1") ("BLOCKED" . "") ("Q" . "say \"hi\"") ("N" . nil))"#);
+        assert_eq!(p, vec![
+            ("CATEGORY".into(), "x y".into()), ("ID".into(), "A-1".into()), ("BLOCKED".into(), "".into()),
+            ("Q".into(), "say \"hi\"".into()), ("N".into(), "nil".into()),
+        ]);
+        assert!(parse_lisp_alist("nil").is_empty());
+        assert!(parse_lisp_alist("").is_empty());
+        assert!(parse_lisp_alist("((garbage").is_empty());
+    }
+
+    #[test]
     fn link_typing_keeps_external_out() {
         let ids: HashSet<&str> = ["a", "b"].into_iter().collect();
         let (e, d, s) = classify_links(&ids, vec![
@@ -458,6 +532,7 @@ pub(crate) mod tests {
         );
         c.execute("INSERT INTO tags VALUES ('\"A\"', '\"rust\"')", []).unwrap();
         c.execute("INSERT INTO aliases VALUES ('\"B\"', '\"Bee\"')", []).unwrap();
+        c.execute(r#"UPDATE nodes SET properties = '(("STATUS" . "draft") ("ID" . "B"))' WHERE id = '"B"'"#, []).unwrap();
         let g = load_graph_from(&c).unwrap();
 
         let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
@@ -471,6 +546,8 @@ pub(crate) mod tests {
         let a1 = &g.nodes[1];
         assert_eq!(a.tags, vec!["rust"]);
         assert_eq!(g.nodes[2].aliases, vec!["Bee"]);
+        assert_eq!(g.nodes[2].properties, vec![("STATUS".to_string(), "draft".to_string()), ("ID".into(), "B".into())]);
+        assert!(a.properties.is_empty());
         assert_eq!(g.nodes[3].title, "Gamma \"q\"");
         assert_eq!(a.file, "/n/a.org");
         assert!(a.mtime > 0, "mtime from the files join");

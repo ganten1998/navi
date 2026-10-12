@@ -259,3 +259,24 @@ pub const THEMES: &[Theme] = &[
         bar_text:  Color32::from_rgb(130, 130, 130),
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use navi_core::groups::{contrast, palette, GroupColour, PALETTE_LEN};
+
+    /// Every group colour reads on every theme: ≥ 3:1 against the canvas
+    /// (WCAG's bar for graphics). All themes are dark today; a light one
+    /// would get the deep palette (checked in navi-core).
+    #[test]
+    fn group_palette_is_readable_on_every_theme() {
+        for t in THEMES {
+            let bg = [t.bg.r(), t.bg.g(), t.bg.b()];
+            for s in 0..PALETTE_LEN as u8 {
+                let c = GroupColour::Slot(s).rgb(bg);
+                assert!(contrast(c, bg) >= 3.0, "{}: slot {s} {c:?} contrast {:.2}", t.name, contrast(c, bg));
+                assert_eq!(c, palette(bg)[s as usize]);
+            }
+        }
+    }
+}

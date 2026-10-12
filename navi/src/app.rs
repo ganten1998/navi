@@ -1,11 +1,13 @@
 use egui::{Color32, Key, Pos2, Rect, Sense, Stroke, Vec2, epaint::FontId};
 use navi_core::{
     config::Config,
-    compute_view, load_graph, DailiesMode, EmacsClient, Graph, GraphData, OrphansMode, ViewFilter, ViewState,
+    groups::{AutoGrouper, GroupResolution, GroupSpec, Grouping},
+    load_graph, DailiesMode, EmacsClient, EvalCtx, Graph, GraphData, OrphansMode, Query, QueryError, View,
+    ViewFilter, ViewState, ViewStore,
 };
 use std::time::{Duration, Instant};
 
-use crate::painter::GraphPainter;
+use crate::painter::{GraphPainter, HullDraw};
 use crate::theme::{Theme, THEMES};
 
 const ZOOM_MIN: f32 = 0.04;
@@ -42,17 +44,29 @@ pub struct NaviApp {
 
     last_click: Option<(usize, Instant)>,
 
-    // ── view pipeline: recomputed only when the filter or the graph changes ──
+    // ── views (views.json): the active one's filters + groups ──
+    views:       ViewStore,
+    db_key:      String,                                // this db's key in views.json
+    active_view: View,                                  // working copy of the active view
+
+    // ── view pipeline: recomputed only when the filter, groups or graph change ──
     view_filter: ViewFilter,
     view:        ViewState,
     view_dirty:  bool,
     view_gen:    u64,                                   // bumps on every recompute
+    grouping:    Grouping,                              // colour memory, partitions, community worker
+    group_spec:  GroupSpec,                             // the active view's groups, queries compiled
+    groups:      GroupResolution,
+    node_colours: Vec<Option<Color32>>,                 // group colour per node (None = theme colour)
+    hulls:       Vec<HullDraw>,
+    colours_key: Option<(u64, usize, bool)>,            // (view_gen, theme, colouring on)
     faded:       Vec<bool>,                             // search / local-graph fade
     faded_key:   Option<(String, usize, Option<usize>, u64)>,
+    search_error: Option<QueryError>,                   // parse error of the query being typed
+    search_hits: usize,
     hov_adj:     Vec<bool>,                             // hovered node + visible neighbours
     hov_key:     Option<(Option<usize>, u64)>,
     local_hops: usize,
-    show_tags: bool,
     show_age: bool,
     show_fps: bool,
     layout_mode: u8, // 0 = Disk, 1 = Column, 2 = Tree
@@ -95,10 +109,14 @@ pub struct NaviApp {
 }
 
 impl NaviApp {
-    pub fn new(graph: Graph, cfg: Config, db_path: String) -> Self {
+    pub fn new(graph: Graph, cfg: Config, db_path: String, mut views: ViewStore, db_key: String) -> Self {
         let emacs = EmacsClient::new(&cfg.emacsclient, &cfg.server_name);
         let show_fps = cfg.show_fps;
-        let view_filter = cfg.view_filter();
+        let active_view = views.active(&db_key);
+        let view_filter = active_view.filter(&cfg.dailies_dirs);
+        let group_spec  = active_view.spec();
+        let mut grouping = Grouping::default();
+        grouping.memory.slots = active_view.auto_colours.clone();
         let mut app = NaviApp {
             graph,
             cfg,
@@ -118,16 +136,26 @@ impl NaviApp {
             node_drag_origin_s: Pos2::ZERO,
             node_drag_samples: Vec::new(),
             last_click: None,
+            views,
+            db_key,
+            active_view,
             view_filter,
             view: ViewState::default(),
             view_dirty: true,
             view_gen: 0,
+            grouping,
+            group_spec,
+            groups: GroupResolution::default(),
+            node_colours: Vec::new(),
+            hulls: Vec::new(),
+            colours_key: None,
             faded: Vec::new(),
             faded_key: None,
+            search_error: None,
+            search_hits: 0,
             hov_adj: Vec::new(),
             hov_key: None,
             local_hops: 0,
-            show_tags: false,
             show_age: true,
             show_fps,
             layout_mode: 0,
@@ -172,13 +200,24 @@ impl NaviApp {
 
     // ── view pipeline ─────────────────────────────────────────────────────────
 
-    /// Recompute the view if the filter or graph changed; push it into the
-    /// graph (physics/layouts) and drop interaction state on hidden nodes.
+    /// Recompute the view if the filter, groups or graph changed; push it
+    /// into the graph (physics/layouts, group pull) and drop interaction
+    /// state on hidden nodes. Groups are resolved inside (see groups.rs:
+    /// hidden groups filter before orphan classification).
     fn refresh_view(&mut self) {
+        if self.grouping.community.poll() { self.view_dirty = true; } // a community partition landed
         if !self.view_dirty { return; }
         self.view_dirty = false;
-        self.view = compute_view(&self.graph, &self.view_filter);
+        let (view, groups) = self.grouping.compute(&self.graph, &self.view_filter, &self.group_spec);
+        self.view   = view;
+        self.groups = groups;
         self.graph.apply_view(&self.view);
+        self.apply_group_pull();
+        // keyed auto-group colours persist with the view (only when new keys appeared)
+        if self.grouping.memory.slots != self.active_view.auto_colours {
+            self.active_view.auto_colours = self.grouping.memory.slots.clone();
+            self.store_view();
+        }
         self.view_gen = self.view_gen.wrapping_add(1);
         let vis = |i: &usize| self.graph.is_visible(*i);
         self.selected = self.selected.filter(vis);
@@ -187,12 +226,51 @@ impl NaviApp {
         if self.last_click.as_ref().is_some_and(|(i, _)| !self.graph.is_visible(*i)) { self.last_click = None; }
     }
 
+    /// Group pull follows the group display (G): off, nothing pulls.
+    fn apply_group_pull(&mut self) {
+        let lists = if self.active_view.colour_groups { self.groups.pull_lists(&self.view.visible) } else { Vec::new() };
+        self.graph.set_group_pull(lists, self.active_view.group_pull);
+    }
+
+    /// Write the working view back into the store and save views.json.
+    fn store_view(&mut self) {
+        *self.views.active_mut(&self.db_key) = self.active_view.clone();
+        if let Err(e) = self.views.save() {
+            self.set_msg(format!("Couldn't save {}: {e}", self.views.path.display()), Duration::from_secs(6));
+        }
+    }
+
+    /// The active view's groups changed (G, Shift+G, a view switch).
+    fn groups_changed(&mut self) {
+        self.group_spec = self.active_view.spec();
+        self.store_view();
+        self.view_dirty = true;
+        self.refresh_view();
+    }
+
+    /// Switch to view `idx` of this db (1-9, [ / ]).
+    fn switch_view(&mut self, idx: usize) {
+        let n = self.views.views(&self.db_key).len();
+        if idx >= n {
+            self.popup = Some((format!("No view {}  ({n} saved)", idx + 1), self.now_secs));
+            return;
+        }
+        self.views.set_active(&self.db_key, idx);
+        let _ = self.views.save();
+        self.active_view = self.views.active(&self.db_key);
+        self.view_filter = self.active_view.filter(&self.cfg.dailies_dirs);
+        self.group_spec  = self.active_view.spec();
+        self.grouping.memory.slots = self.active_view.auto_colours.clone();
+        self.popup = Some((format!("View  {}  ({}/{n})", self.active_view.name, idx + 1), self.now_secs));
+        self.filter_changed();
+    }
+
     /// A filter key changed the view: persist it and let the layout re-form
     /// around what's left (Disk resumes physics; Column/Tree re-run in place).
     fn filter_changed(&mut self) {
-        self.cfg.dailies = self.view_filter.dailies;
-        self.cfg.orphans = self.view_filter.orphans;
-        self.cfg.save();
+        self.active_view.dailies = self.view_filter.dailies;
+        self.active_view.orphans = self.view_filter.orphans;
+        self.store_view();
         self.view_dirty = true;
         self.refresh_view();
         match self.layout_mode {
@@ -203,24 +281,50 @@ impl NaviApp {
     }
 
     /// Search + local-graph fade mask; rebuilt only when its inputs change.
+    /// The search box speaks the query language (query.rs); while the text
+    /// doesn't parse, nothing fades and the status bar shows the error.
     fn refresh_faded(&mut self) {
         let key = (self.search_query.clone(), self.local_hops, self.selected, self.view_gen);
         if self.faded_key.as_ref() == Some(&key) { return; }
         let n = self.graph.node_list.len();
-        let q = self.search_query.to_lowercase();
+        let parsed = Query::parse(&self.search_query);
+        self.search_error = parsed.as_ref().err().cloned();
+        let query = parsed.ok().filter(|q| !q.is_empty());
+        let cx = EvalCtx::from_view(&self.graph, &self.view);
         let local = match (self.local_hops, self.selected) {
             (h, Some(sel)) if h > 0 => Some(self.graph.bfs_visible(sel, h)),
             _ => None,
         };
+        let mut hits = 0;
         self.faded = (0..n).map(|i| {
             if !self.graph.is_visible(i) { return false; }
-            let nd = &self.graph.node_list[i];
-            let in_search = q.is_empty() || nd.title.to_lowercase().contains(&q)
-                || nd.aliases.iter().any(|a| a.to_lowercase().contains(&q));
+            let in_search = match &query { Some(q) => q.matches(&cx, i), None => true };
+            if in_search { hits += 1; }
             let in_local = match &local { Some(l) => l[i], None => true };
             !in_search || !in_local
         }).collect();
+        self.search_hits = hits;
         self.faded_key = Some(key);
+    }
+
+    /// Group colour per node and the hulls to draw; rebuilt when the view,
+    /// the theme or G changes.
+    fn refresh_colours(&mut self) {
+        let key = (self.view_gen, self.theme_idx, self.active_view.colour_groups);
+        if self.colours_key == Some(key) { return; }
+        self.colours_key = Some(key);
+        let on = self.active_view.colour_groups;
+        let bg = self.theme().bg;
+        let bg = [bg.r(), bg.g(), bg.b()];
+        let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+        self.node_colours = self.groups.primary.iter()
+            .map(|p| p.filter(|_| on).map(|g| rgb(self.groups.groups[g].colour.rgb(bg)))).collect();
+        self.hulls = if on {
+            self.groups.member_lists(&self.view.visible).into_iter().zip(&self.groups.groups)
+                .filter(|(m, g)| g.hull && g.visible && !m.is_empty())
+                .map(|(members, g)| HullDraw { colour: rgb(g.colour.rgb(bg)), label: g.label.clone(), members })
+                .collect()
+        } else { Vec::new() };
     }
 
     fn refresh_hov_adj(&mut self) {
@@ -307,20 +411,31 @@ impl NaviApp {
         self.set_msg(msg, Duration::from_secs(24 * 3600));
     }
 
+    /// Enter: jump to the best visible match (a title starting with the
+    /// first search word ranks first, then node order).
     fn search_commit(&mut self) {
-        let q = self.search_query.to_lowercase();
-        if q.is_empty() { self.search_query.clear(); return; }
-        let mut matches: Vec<_> = self.graph.vis_idx.iter().map(|&i| (i, &self.graph.node_list[i]))
-            .filter(|(_, nd)|
-                nd.title.to_lowercase().contains(&q) ||
-                nd.aliases.iter().any(|a| a.to_lowercase().contains(&q))
-            )
-            .map(|(i, nd)| (i, nd.title.to_lowercase().starts_with(&q), nd.x, nd.y))
+        let query = match Query::parse(&self.search_query) {
+            Ok(q) if !q.is_empty() => q,
+            Ok(_) => { self.search_query.clear(); return; }
+            Err(e) => {
+                self.set_msg(format!("Search: {e}"), Duration::from_secs(5));
+                self.search_query.clear();
+                return;
+            }
+        };
+        let lead = query.first_bare().unwrap_or_default();
+        let cx = EvalCtx::from_view(&self.graph, &self.view);
+        let mut matches: Vec<_> = self.graph.vis_idx.iter().copied()
+            .filter(|&i| query.matches(&cx, i))
+            .map(|i| { let nd = &self.graph.node_list[i]; (i, !lead.is_empty() && nd.title.to_lowercase().starts_with(&lead), nd.x, nd.y) })
             .collect();
         matches.sort_by_key(|(_, starts, _, _)| !starts);
-        if let Some(&(idx, _, nx, ny)) = matches.first() {
-            self.selected = Some(idx);
-            self.pan = Vec2::new(-(nx as f32) * self.zoom, -(ny as f32) * self.zoom);
+        match matches.first() {
+            Some(&(idx, _, nx, ny)) => {
+                self.selected = Some(idx);
+                self.pan = Vec2::new(-(nx as f32) * self.zoom, -(ny as f32) * self.zoom);
+            }
+            None => self.set_msg("Search: no visible match".into(), Duration::from_secs(3)),
         }
         self.search_query.clear();
     }
@@ -395,7 +510,7 @@ impl NaviApp {
                     self.selected = old_sel.and_then(|s| self.graph.nodes.get(&s).copied());
                     self.view_dirty = true;
                     self.refresh_view();
-                    self.set_msg(format!("Reloaded — {nn} nodes  {ne} edges{diff}"), Duration::from_secs(3));
+                    self.set_msg(format!("Reloaded: {nn} nodes  {ne} edges{diff}"), Duration::from_secs(3));
                 }
                 Err(e) => self.set_msg(format!("Reload failed: {e}"), Duration::from_secs(6)),
             }
@@ -411,11 +526,17 @@ impl NaviApp {
             // the renderer at full speed for its whole lifetime.
             || self.status_msg.as_ref().map_or(false, |(_, t, d)| t.elapsed() < (*d).min(Duration::from_secs(6)))
             || self.reload_pending.is_some()
+            || self.grouping.community.pending()
     }
 
     fn build_status(&self) -> String {
         if self.search_active {
-            return format!("  Search: {}█   ESC: Cancel  Enter: Jump", self.search_query);
+            let tail = match &self.search_error {
+                Some(e) => format!("   {e}"),
+                None if self.search_query.trim().is_empty() => "   ESC: Cancel  Enter: Jump".into(),
+                None => format!("   {} matching   ESC: Cancel  Enter: Jump", self.search_hits),
+            };
+            return format!("  Search: {}█{tail}", self.search_query);
         }
         if let Some((msg, start, dur)) = &self.status_msg {
             if start.elapsed() < *dur { return format!("  {msg}"); }
@@ -424,7 +545,19 @@ impl NaviApp {
         let n = if c.visible < c.total { format!("{}/{}", c.visible, c.total) } else { c.total.to_string() };
         let e = c.visible_edges;
         let mut filters = Vec::<String>::new();
-        if self.show_tags { filters.push("Tags:On".into()); }
+        if self.views.views(&self.db_key).len() > 1 { filters.push(format!("View:{}", self.active_view.name)); }
+        if self.active_view.colour_groups {
+            let auto = self.active_view.auto;
+            let mut what = Vec::new();
+            if !self.active_view.groups.is_empty() { what.push(format!("{} manual", self.active_view.groups.len())); }
+            if auto != AutoGrouper::None { what.push(auto.label()); }
+            let pending = if self.grouping.community.pending() { " (computing)" } else { "" };
+            filters.push(format!("Groups:{}{pending}", if what.is_empty() { "None".into() } else { what.join("+") }));
+        }
+        if c.hidden_by_groups > 0 { filters.push(format!("Hidden by groups {}", c.hidden_by_groups)); }
+        if let Some(bad) = self.groups.groups.iter().find(|g| g.error.is_some()) {
+            filters.push(format!("Group \"{}\": {}", bad.label, bad.error.as_ref().map(|e| e.to_string()).unwrap_or_default()));
+        }
         if self.view_filter.dailies == DailiesMode::Hide { filters.push("Dailies:Hidden".into()); }
         if self.view_filter.orphans != OrphansMode::Show {
             let mut why = Vec::new();
@@ -436,11 +569,22 @@ impl NaviApp {
         match self.local_hops { 1 => filters.push("Local:1hop".into()), 2 => filters.push("Local:2hop".into()), 3 => filters.push("Local:3hop".into()), _ => {} }
         let filt = if filters.is_empty() { String::new() } else { format!("  ·  {}", filters.join("  ")) };
 
-        if let Some(nd) = self.selected.and_then(|i| self.graph.node_list.get(i)) {
-            // char-based truncation — byte slicing panics mid-codepoint on
+        if let Some(sel) = self.selected.filter(|&i| i < self.graph.node_list.len()) {
+            let nd = &self.graph.node_list[sel];
+            // char-based truncation: byte slicing panics mid-codepoint on
             // CJK titles
             let t: String = nd.title.chars().take(52).collect();
-            return format!("  {t}  ·  {n} Nodes  ·  {e} Edges{filt}");
+            // every group the node is in; the one that colours it is marked
+            let mem = self.groups.members.get(sel).map(|m| m.as_slice()).unwrap_or(&[]);
+            let groups = if mem.is_empty() { String::new() } else {
+                let primary = self.groups.primary.get(sel).copied().flatten();
+                let names: Vec<String> = mem.iter().map(|&g| {
+                    let l = &self.groups.groups[g].label;
+                    if Some(g) == primary && self.active_view.colour_groups { format!("{l} (colour)") } else { l.clone() }
+                }).collect();
+                format!("  ·  in {}", names.join(", "))
+            };
+            return format!("  {t}{groups}  ·  {n} Nodes  ·  {e} Edges{filt}");
         }
         format!("  {n} Nodes  ·  {e} Edges{filt}")
     }
@@ -492,9 +636,32 @@ impl NaviApp {
                                 self.popup = Some((format!("Orphans  {}", self.view_filter.orphans.label()), self.now_secs));
                                 self.filter_changed();
                             }
+                            Key::G if i.modifiers.shift => {
+                                self.active_view.auto = self.active_view.auto.cycled();
+                                self.active_view.colour_groups = true;
+                                self.popup = Some((format!("Grouping  {}", self.active_view.auto.label()), self.now_secs));
+                                self.groups_changed();
+                            }
                             Key::G => {
-                                self.show_tags = !self.show_tags;
-                                self.popup = Some((if self.show_tags { "Tag Colors  On".into() } else { "Tag Colors  Off".into() }, self.now_secs));
+                                let v = &mut self.active_view;
+                                v.colour_groups = !v.colour_groups;
+                                // first G with nothing to group: the old tag colouring
+                                if v.colour_groups && v.groups.is_empty() && v.auto == AutoGrouper::None { v.auto = AutoGrouper::Tag; }
+                                let msg = if v.colour_groups { format!("Groups  On  ·  {}", v.auto.label()) } else { "Groups  Off".into() };
+                                self.popup = Some((msg, self.now_secs));
+                                self.groups_changed();
+                            }
+                            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5
+                            | Key::Num6 | Key::Num7 | Key::Num8 | Key::Num9 => {
+                                let idx = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
+                                           Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().position(|k| k == key).unwrap_or(0);
+                                self.switch_view(idx);
+                            }
+                            Key::OpenBracket | Key::CloseBracket => {
+                                let n   = self.views.views(&self.db_key).len().max(1);
+                                let cur = self.views.active_index(&self.db_key);
+                                let idx = if *key == Key::CloseBracket { (cur + 1) % n } else { (cur + n - 1) % n };
+                                self.switch_view(idx);
                             }
                             Key::A => {
                                 self.show_age = !self.show_age;
@@ -721,6 +888,60 @@ impl NaviApp {
         }
     }
 
+    /// Top-left legend while group colouring is on: each group's colour,
+    /// name and how many of its nodes are on screen.
+    fn paint_legend(&self, painter: &egui::Painter, rect: Rect, t: Theme) {
+        const MAX_ROWS: usize = 12;
+        let rows: Vec<(Color32, String, bool)> = {
+            let bg = [t.bg.r(), t.bg.g(), t.bg.b()];
+            let mut v: Vec<(Color32, String, bool)> = self.groups.groups.iter()
+                .filter(|g| g.manual || g.shown > 0 || !g.visible)
+                .map(|g| {
+                    let c = g.colour.rgb(bg);
+                    let label = if !g.visible { format!("{}  hidden", g.label) }
+                                else if g.error.is_some() { format!("{}  (bad query)", g.label) }
+                                else { format!("{}  {}", g.label, g.shown) };
+                    (Color32::from_rgb(c[0], c[1], c[2]), label, g.visible && g.error.is_none())
+                }).collect();
+            if v.len() > MAX_ROWS {
+                let more = v.len() - (MAX_ROWS - 1);
+                v.truncate(MAX_ROWS - 1);
+                v.push((Color32::TRANSPARENT, format!("+{more} more"), false));
+            }
+            v
+        };
+        let title = if self.grouping.community.pending() && rows.is_empty() { "Computing communities…".to_string() }
+                    else if rows.is_empty() { format!("{}: no groups", self.active_view.auto.label()) }
+                    else { String::new() };
+        let font  = FontId::proportional(12.5);
+        let row_h = 18.0;
+        let pad   = 10.0;
+        let width = rows.iter().chain(std::iter::once(&(Color32::TRANSPARENT, title.clone(), false)))
+            .map(|(_, l, _)| painter.layout_no_wrap(l.clone(), font.clone(), t.label).size().x)
+            .fold(0.0f32, f32::max).min(320.0) + 22.0 + pad * 2.0;
+        let n_rows = rows.len().max(if title.is_empty() { 0 } else { 1 });
+        if n_rows == 0 { return; }
+        let r = Rect::from_min_size(Pos2::new(rect.left() + 18.0, rect.top() + 52.0),
+                                    Vec2::new(width, n_rows as f32 * row_h + pad * 1.2));
+        painter.rect_filled(r, 6.0, Color32::from_rgba_unmultiplied(t.bar_bg.r(), t.bar_bg.g(), t.bar_bg.b(), 215));
+        painter.rect_stroke(r, 6.0, Stroke::new(1.0_f32, t.bar_line));
+        let mut y = r.top() + pad * 0.6 + row_h / 2.0;
+        if rows.is_empty() {
+            painter.text(Pos2::new(r.left() + pad, y), egui::Align2::LEFT_CENTER, title, font, t.bar_text);
+            return;
+        }
+        for (c, label, bright) in rows {
+            if c != Color32::TRANSPARENT {
+                let dot = Pos2::new(r.left() + pad + 5.0, y);
+                if bright { painter.circle_filled(dot, 5.0, c); } else { painter.circle_stroke(dot, 4.5, Stroke::new(1.2_f32, c)); }
+            }
+            let col = if bright { t.label_hov } else { t.bar_text };
+            let text: String = label.chars().take(44).collect();
+            painter.text(Pos2::new(r.left() + pad + 18.0, y), egui::Align2::LEFT_CENTER, text, font.clone(), col);
+            y += row_h;
+        }
+    }
+
     fn paint_help(&self, painter: &egui::Painter, rect: Rect, t: Theme) {
         let c = &self.view.counts;
         let orphans = match (c.isolated_by_filters, c.daily_only) {
@@ -741,12 +962,14 @@ impl NaviApp {
             ("  Tab / Shift-Tab", "Cycle nodes"),
             ("  Enter / Space", "Open selected in Emacs"),
             ("  T", "Cycle theme"),
-            ("  G", "Toggle tag colouring"),
+            ("  G", "Toggle group colours, hulls, pull"),
+            ("  Shift-G", "Cycle auto grouping"),
+            ("  1-9  /  [ ]", "Switch view"),
             ("  A", "Toggle age heatmap"),
             ("  D", "Show / hide daily notes"),
             ("  O", "Cycle orphans  (shown → hidden → only)"),
             ("  L", "Cycle local graph (1–3 hops / off)"),
-            ("  /", "Search by title or alias"),
+            ("  /", "Search (title, tag:, dir:, OR, -x)"),
             ("  V", "Cycle layout  (Disk → Column → Tree)"),
             ("  W", "Reload graph from database"),
             ("  F", "Toggle FPS counter"),
@@ -908,6 +1131,7 @@ impl NaviApp {
         self.handle_pointer(ctx);
         self.refresh_faded();
         self.refresh_hov_adj();
+        self.refresh_colours();
 
         // ── Render ────────────────────────────────────────────────────────────
         let t = self.theme();
@@ -957,7 +1181,8 @@ impl NaviApp {
                     selected: self.selected,
                     faded: &self.faded,
                     hov_adj: &self.hov_adj,
-                    show_tags: self.show_tags,
+                    node_colours: &self.node_colours,
+                    hulls: &self.hulls,
                     show_age: self.show_age,
                     now_secs: self.now_secs,
                     graph_rect,
@@ -971,6 +1196,7 @@ impl NaviApp {
 
                 let t_grid   = Instant::now();
                 if !no_grid   { gp.paint_grid(&painter);  }
+                if !self.hulls.is_empty() { gp.paint_hulls(&painter); }
                 let t_edges  = Instant::now();
                 if !no_edges  { gp.paint_edges(&painter); }
                 let t_nodes  = Instant::now();
@@ -978,6 +1204,7 @@ impl NaviApp {
                 let t_labels = Instant::now();
                 if !no_labels && self.zoom > 0.25 { gp.paint_labels(&painter); }
                 let t_help   = Instant::now();
+                if self.active_view.colour_groups { self.paint_legend(&painter, graph_rect, t); }
                 if self.help_anim > 0.01 { self.paint_help(&painter, graph_rect, t); }
                 let t_end    = Instant::now();
 

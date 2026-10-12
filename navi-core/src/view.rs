@@ -3,7 +3,8 @@
 //! (painter, physics, layouts, fit, Tab, hit-testing, status bar) reads.
 //!
 //! Order of operations:
-//!   1. attribute filters (dailies)        → `pass[i]`
+//!   1. attribute filters (dailies, then   → `pass[i]`
+//!      hidden groups: `hidden` mask)
 //!   2. effective edges                    → both endpoints pass, and — when
 //!      `links_to_dailies_count` is false — neither endpoint is a daily
 //!   3. orphan classification              → `orphan[i]` = passes and has no
@@ -25,6 +26,15 @@
 //! have drawn edges (`visible_edges` holds every real edge between visible
 //! nodes); layouts take the view's orphan mask, not their edges, so they sit
 //! in the orphan cluster like any other orphan.
+//!
+//! Groups (groups.rs) run the pipeline twice: once WITHOUT group hiding and
+//! with orphans shown (`compute_view`), which is the world group queries,
+//! `orphan` and the Component grouper see; then again with the nodes whose
+//! every group is hidden passed as `hidden` (`compute_view_hiding`). Hiding a
+//! group is therefore an attribute filter like hiding dailies: it comes
+//! BEFORE orphan classification, so a note whose only links were into a
+//! hidden group is an orphan in the final view ("isolated by filters"), and
+//! no group's membership depends on another group's visibility.
 //!
 //! Dailies dirs are matched below the NOTES ROOT (the deepest directory every
 //! node's file shares, ≈ org-roam-directory), so a `~/Journal/roam/` checkout
@@ -116,6 +126,7 @@ pub struct ViewCounts {
     pub isolated_by_filters: usize, // in-view orphans whose real links all go to filtered-out nodes
     pub daily_only:          usize, // in-view orphans only by links_to_dailies_count = false
     pub dangling:            usize, // unresolved / missing-target links
+    pub hidden_by_groups:    usize, // passed the dailies filter, removed because every group they're in is hidden
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,7 +146,7 @@ fn date_title_re() -> &'static Regex {
 }
 
 /// Directory components of a path (`/` and `\` both separate; file name dropped).
-fn dir_components(file: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn dir_components(file: &str) -> impl Iterator<Item = &str> {
     let mut comps: Vec<&str> = file.split(['/', '\\']).collect();
     comps.pop(); // file name
     comps.into_iter()
@@ -166,13 +177,19 @@ pub fn is_daily(title: &str, file: &str, root_depth: usize, dirs: &[String]) -> 
         .any(|c| !c.is_empty() && dirs.iter().any(|d| d.eq_ignore_ascii_case(c)))
 }
 
-pub fn compute_view(g: &Graph, f: &ViewFilter) -> ViewState {
+pub fn compute_view(g: &Graph, f: &ViewFilter) -> ViewState { compute_view_hiding(g, f, &[]) }
+
+/// `compute_view` with `hidden[i]` (when `hidden` has one entry per node)
+/// removing nodes in step 1, alongside the dailies filter. Groups pass the
+/// nodes whose every group is hidden.
+pub fn compute_view_hiding(g: &Graph, f: &ViewFilter, hidden: &[bool]) -> ViewState {
     let n = g.node_list.len();
+    let hidden = |i: usize| hidden.len() == n && hidden[i];
 
     // 1. attribute filters
     let root  = notes_root_depth(g.node_list.iter().map(|nd| nd.file.as_str()));
     let daily: Vec<bool> = g.node_list.iter().map(|nd| is_daily(&nd.title, &nd.file, root, &f.dailies_dirs)).collect();
-    let pass:  Vec<bool> = daily.iter().map(|&d| !(d && f.dailies == DailiesMode::Hide)).collect();
+    let pass:  Vec<bool> = daily.iter().enumerate().map(|(i, &d)| !(d && f.dailies == DailiesMode::Hide) && !hidden(i)).collect();
 
     // 2. effective edges → 3. orphan classification
     let mut pass_deg = vec![0usize; n]; // real edges to passing nodes
@@ -219,6 +236,7 @@ pub fn compute_view(g: &Graph, f: &ViewFilter) -> ViewState {
         isolated_by_filters: count(&|i| orphan[i] && !db_orphan[i] && pass_deg[i] == 0),
         daily_only:          count(&|i| orphan[i] && pass_deg[i] > 0),
         dangling:            g.dangling.len(),
+        hidden_by_groups:    count(&|i| hidden(i) && !(daily[i] && f.dailies == DailiesMode::Hide)),
     };
     ViewState { visible, visible_edges, visible_degree, orphan, db_orphan, daily, counts }
 }
@@ -442,6 +460,7 @@ mod tests {
         assert_eq!(v.counts, ViewCounts {
             total: 3, visible: 2, visible_edges: 1, dailies: 0,
             orphans_in_view: 1, orphans_in_db: 1, isolated_by_filters: 0, daily_only: 0, dangling: 0,
+            hidden_by_groups: 0,
         });
     }
 
@@ -462,6 +481,29 @@ mod tests {
         assert_eq!(v.counts.visible_edges, 1, "https link stays out of the graph");
         let v = compute_view(&g, &filt(DailiesMode::Hide, OrphansMode::Only, true));
         assert_eq!(v.counts.dangling, 2, "a db-wide count, whatever the filters");
+    }
+
+    /// Group hiding is an attribute filter: it runs before orphan
+    /// classification, exactly like hiding dailies.
+    #[test]
+    fn hidden_mask_filters_before_orphan_classification() {
+        let g = fixture();
+        let (x, d, a, b) = (idx(&g, "x"), idx(&g, "d"), idx(&g, "a"), idx(&g, "b"));
+        let mut hidden = vec![false; g.node_list.len()];
+        hidden[d] = true; // hide the daily as if by a group
+        let v = compute_view_hiding(&g, &ViewFilter::default(), &hidden);
+        assert!(!v.visible[d] && v.visible[x]);
+        assert!(v.orphan[x], "x lost its only link to a group-hidden node");
+        assert_eq!(v.counts.isolated_by_filters, 1);
+        assert_eq!(v.counts.hidden_by_groups, 1);
+        let v = compute_view_hiding(&g, &filt(DailiesMode::Show, OrphansMode::Hide, true), &hidden);
+        assert_eq!(visible_ids(&g, &v), vec!["a", "b"]);
+        // already hidden by the dailies filter: not counted twice
+        let v = compute_view_hiding(&g, &filt(DailiesMode::Hide, OrphansMode::Show, true), &hidden);
+        assert_eq!(v.counts.hidden_by_groups, 0);
+        // a mask of the wrong length is ignored (stale), never indexed
+        let v = compute_view_hiding(&g, &ViewFilter::default(), &[true]);
+        assert!(v.visible[a] && v.visible[b] && v.visible[d]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Navi
 
-An interactive graph viewer for [org-roam](https://www.orgroam.com/), running as a native desktop window. No Emacs package required — Navi reads your `org-roam.db` directly and opens nodes in your existing Emacs process via `emacsclient`.
+An interactive graph viewer for [org-roam](https://www.orgroam.com/), running as a native desktop window. No Emacs package required: Navi reads your `org-roam.db` directly and opens nodes in your existing Emacs process via `emacsclient`.
 
 Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https://github.com/grovesNL/glow) (OpenGL). On macOS it ships a hand-rolled vsync-aligned event loop that locks the renderer to the panel's native refresh rate (60, 120, 240 Hz) with sub-millisecond frame time variance, then drops to ~30 fps when idle to save power on laptops.
 
@@ -8,9 +8,9 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 ## Status
 
-- **macOS** — primary target, fully supported. Tested on Apple Silicon (M-series) at 60 / 120 / 240 Hz. A pre-built `Navi.app` ships with each release.
-- **Linux** — supported, X11 and Wayland backends both built in (one binary; X11 is picked automatically under i3 and other X11 WMs). Vsync pacing via blocking `SwapInterval::Wait(1)` swaps on X11, and a refresh-rate timer on Wayland. Sets `WM_CLASS` / `app_id` to `navi` for window-manager rules. Pre-built x86_64 and aarch64 glibc binaries ship with each release.
-- **Windows** — supported. Talks to the Emacs server over its native TCP `server-file` mechanism, finds `emacsclientw.exe` across the official installer / Chocolatey / Scoop / MSYS2 layouts, and builds as a GUI-subsystem app (no console window). A pre-built x64 exe ships with each release.
+- **macOS**: primary target, fully supported. Tested on Apple Silicon (M-series) at 60 / 120 / 240 Hz. A pre-built `Navi.app` ships with each release.
+- **Linux**: supported, X11 and Wayland backends both built in (one binary; X11 is picked automatically under i3 and other X11 WMs). Vsync pacing via blocking `SwapInterval::Wait(1)` swaps on X11, and a refresh-rate timer on Wayland. Sets `WM_CLASS` / `app_id` to `navi` for window-manager rules. Pre-built x86_64 and aarch64 glibc binaries ship with each release.
+- **Windows**: supported. Talks to the Emacs server over its native TCP `server-file` mechanism, finds `emacsclientw.exe` across the official installer / Chocolatey / Scoop / MSYS2 layouts, and builds as a GUI-subsystem app (no console window). A pre-built x64 exe ships with each release.
 
 ---
 
@@ -20,9 +20,9 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 All from the [Releases](https://codeberg.org/ganten1998/navi/releases) page:
 
-- **macOS (Apple Silicon)** — `Navi-<version>-host.zip`: unzip, double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it — right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
-- **Linux** — `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL — present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).
-- **Windows (x64)** — `navi-<version>-windows-x86_64.zip`: unzip, run `navi.exe`.
+- **macOS (Apple Silicon)**: `Navi-<version>-host.zip`: unzip, double-click `Navi.app`. The bundle is ad-hoc signed; on first launch macOS Gatekeeper may flag it; right-click → Open, or run `xattr -cr Navi.app` to clear the quarantine flag.
+- **Linux**: `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL, present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).
+- **Windows (x64)**: `navi-<version>-windows-x86_64.zip`: unzip, run `navi.exe`.
 
 ### From source
 
@@ -47,10 +47,10 @@ On first run, Navi auto-detects your `org-roam.db` and creates `~/.config/navi/c
 
 ## Requirements
 
-- **Rust 1.75+** (stable) — install via [rustup](https://rustup.rs/) (source builds only)
+- **Rust 1.75+** (stable), install via [rustup](https://rustup.rs/) (source builds only)
 - **org-roam v2** database (`nodes`, `files`, `links`, `tags`, `aliases`)
-- **emacsclient** + a running Emacs server (`(server-start)` in your init) — for double-click-to-open. On Windows the server runs in TCP mode automatically; nothing extra to configure.
-- A working OpenGL (or GLES) context — built into macOS, standard on Linux (Mesa) and Windows
+- **emacsclient** + a running Emacs server (`(server-start)` in your init), for double-click-to-open. On Windows the server runs in TCP mode automatically; nothing extra to configure.
+- A working OpenGL (or GLES) context, built into macOS, standard on Linux (Mesa) and Windows
 
 ---
 
@@ -65,24 +65,22 @@ Config file: `~/.config/navi/config.json`. Created on first run with auto-detect
   "server_name": "server",
   "show_fps": true,
   "borderless": false,
-  "dailies": "show",
-  "orphans": "show",
-  "dailies_dirs": ["daily", "dailies", "journal", "journals"],
-  "links_to_dailies_count": true
+  "dailies_dirs": ["daily", "dailies", "journal", "journals"]
 }
 ```
 
 | Key | Description |
 |---|---|
 | `db` | Path to `org-roam.db`. Auto-detected from common Emacs / Doom / Spacemacs / XDG locations on first run. |
-| `emacsclient` | Path to `emacsclient`. Bare names are resolved against `PATH` plus the common per-OS install locations (Homebrew, MacPorts, `/Applications/Emacs.app`, `~/.nix-profile`, Snap, and on Windows the official installer, Chocolatey, Scoop, and MSYS2 layouts — preferring `emacsclientw.exe` there). |
+| `emacsclient` | Path to `emacsclient`. Bare names are resolved against `PATH` plus the common per-OS install locations (Homebrew, MacPorts, `/Applications/Emacs.app`, `~/.nix-profile`, Snap, and on Windows the official installer, Chocolatey, Scoop, and MSYS2 layouts, preferring `emacsclientw.exe` there). |
 | `server_name` | Emacs server name (default `server`). |
 | `show_fps` | Show FPS counter in the status bar (`F` toggles at runtime). |
-| `borderless` | Draw the window without titlebar/decorations (default `false`). Leave off under tiling WMs — a decorated, resizable window is what lets AeroSpace / i3 tile it. |
-| `dailies` | Daily-notes filter, `"show"` or `"hide"` (`D` toggles and saves it). Read back in any case, and `"shown"` / `"hidden"` work too. A bad value in any key falls back to that key's default alone; the rest of the file is kept. |
-| `orphans` | Orphan filter, `"show"`, `"hide"` or `"only"` (`O` cycles and saves it). An orphan is a node with no link to another node *in the current view*. Hiding dailies can isolate a note whose only links were to dailies; the status bar counts those as "isolated by filters". Read back like `dailies`, plus `"only"`. |
+| `borderless` | Draw the window without titlebar/decorations (default `false`). Leave off under tiling WMs: a decorated, resizable window is what lets AeroSpace / i3 tile it. |
 | `dailies_dirs` | Directory names that mark a daily note (default `daily`, `dailies`, `journal`, `journals`). Matched as whole path components, case-insensitively, `/` or `\` separated, so `dailyish/` and `daily.org` don't match. Only directories *below* the notes root (the deepest folder every note shares) count, so notes kept under e.g. `~/Journal/roam/` aren't all dailies. A `YYYY-MM-DD` title is always a daily. |
-| `links_to_dailies_count` | When `false`, a link to a daily doesn't save a note from being an orphan: a note linked only to dailies counts as one. A daily stays connected if it links to a connected note (otherwise it's an orphan too, so `O` never leaves one drawn alone). The status bar calls these "daily-only". Only matters while dailies are shown; default `true`. |
+
+A bad value in any key falls back to that key's default alone; the rest of the file is kept. Saves are atomic (a temp file renamed into place).
+
+The filters `dailies`, `orphans` and `links_to_dailies_count` used to live here. They now belong to a [view](#views-and-groups): on the first run with a db that has no views yet, its `Default` view takes whatever values config.json had, and only once `views.json` holding them is written are the keys dropped from config.json.
 
 The legacy config path `~/.config/org-roam-graph/config.json` is also read; the next save writes to the new path.
 
@@ -102,6 +100,101 @@ The legacy config path `~/.config/org-roam-graph/config.json` is also read; the 
 
 ---
 
+## Views and groups
+
+A **view** is a named set of filters and groups. Views are stored per org-roam db (keyed by its canonical path) in `~/.config/navi/views.json`, and navi remembers which view was last active for each db. `1` to `9` switch to a view by position, `[` and `]` step through them.
+
+A **group** is a query plus how it's shown: a colour (always), and per group whether it is `visible`, whether it `pull`s its members together (a soft spring toward the group's centroid; off by default) and whether it draws a `hull` (a faint padded outline behind its nodes, labelled at their centre).
+
+- **Manual groups** are an ordered list. A node can be in several; the first *visible* group it's in gives it its colour, and the status bar shows every group of the selected node, marking the one that colours it.
+- One **automatic grouper** can be active, ranked below the manual groups (`Shift+G` cycles it):
+
+| Grouper | Groups |
+|---|---|
+| `folder` | Directory below the notes root (the deepest folder every note shares), `depth` levels deep. Notes directly in the root stay ungrouped. |
+| `tag` | One group per tag. A node with several tags is in all of them and coloured by the first alphabetically (never by database order). |
+| `component` | Connected pieces of the graph left by the dailies filter, largest first. Orphans are not grouped. |
+| `community` | Densely linked clusters (Louvain modularity with a connectivity refinement, so every community is connected; deterministic, seeded). `resolution` above 1 makes more, smaller communities. Computed on every real link by default (`"scope": "all"`), or on what the dailies filter leaves (`"scope": "visible"`). Large graphs compute in the background. |
+| `file` | A file node with its heading nodes. Files without headings stay ungrouped. |
+
+- **Hiding** a group hides only the nodes whose *every* group is hidden; nodes in no group are never hidden by groups. Hiding happens before orphans are worked out, like the dailies filter: a note whose only links went into a hidden group becomes an orphan ("isolated by filters"), and `O` treats it like any other.
+- **Colours stay put.** Manual groups store their colour. Folder, tag and file groups take a palette colour from a hash of their name, remembered in the view (`auto_colours`), so a new tag never repaints an old one. Components and communities keep their colours across recomputation by matching each new group to the old group it overlaps most. Ungrouped nodes and orphans keep the theme's own node colour. The palette is readable on every theme.
+- `G` turns the group display on and off: colours, hulls, pull and the legend (top left, with how many nodes of each group are on screen). Pressing `G` in a view with no groups starts the `tag` grouper, like the old tag colouring. Group visibility still filters while the display is off.
+
+```json
+{
+  "version": 1,
+  "dbs": {
+    "/Users/me/.emacs.d/org-roam.db": {
+      "active": "Default",
+      "views": [
+        {
+          "name": "Default",
+          "colour_groups": true,
+          "groups": [
+            { "name": "Rust", "query": "tag:rust OR title:cargo", "colour": "#ff8a3d", "hull": true },
+            { "name": "Blog", "query": "dir:posts", "pull": true },
+            { "name": "Loose ends", "query": "dangling OR orphan", "visible": false }
+          ],
+          "auto": { "kind": "community", "resolution": 1.0, "scope": "all" },
+          "auto_hidden": [],
+          "auto_pull": false,
+          "auto_hull": false,
+          "dailies": "show",
+          "orphans": "show",
+          "links_to_dailies_count": true,
+          "group_pull": 0.1
+        },
+        { "name": "Writing", "auto": { "kind": "folder", "depth": 1 }, "colour_groups": true, "dailies": "hide" }
+      ]
+    }
+  }
+}
+```
+
+| View key | Description |
+|---|---|
+| `name` | Shown when switching (`View  Writing  (2/2)`) and in the status bar when a db has more than one view. |
+| `groups` | Manual groups, highest precedence first: `name`, `query` (see below), `colour` (`"#rrggbb"`; left out, a palette colour from the name), `visible` (default `true`), `pull`, `hull` (default `false`). A group whose query doesn't parse matches nothing and the status bar says why. |
+| `auto` | The automatic grouper: `{"kind": "none" \| "folder" \| "tag" \| "component" \| "community" \| "file"}`, plus `depth` (folder, default 1), `resolution` and `scope` (community). |
+| `auto_hidden` | Keys of hidden automatic groups, like `"tag:draft"` or `"folder:archive"`. |
+| `auto_pull`, `auto_hull` | Pull / hull for every automatic group. |
+| `colour_groups` | The `G` toggle. |
+| `dailies` | `"show"` or `"hide"` (`D` toggles and saves it). Read back in any case; `"shown"` / `"hidden"` work too. |
+| `orphans` | `"show"`, `"hide"` or `"only"` (`O` cycles and saves it). An orphan is a node with no link to another node *in the current view*. Hiding dailies (or a group) can isolate a note whose only links went there; the status bar counts those as "isolated by filters". |
+| `links_to_dailies_count` | When `false`, a link to a daily doesn't save a note from being an orphan: a note linked only to dailies counts as one. A daily stays connected if it links to a connected note (otherwise it's an orphan too, so `O` never leaves one drawn alone). The status bar calls these "daily-only". Only matters while dailies are shown; default `true`. |
+| `group_pull` | Strength of `pull` (default `0.1`, a slow drift; `0.5` makes tight clusters; at most `1.0`). |
+| `auto_colours` | Written by navi: the palette slot each folder / tag / file group got, so colours survive restarts. |
+
+Loading is forgiving: a bad view, group or value is dropped on its own and everything else is kept, and navi first copies the original file to `views.json.bad` so nothing you wrote is lost. Writes are atomic.
+
+### Query language
+
+The search box (`/`) and group queries share one language. Terms next to each other must all match (AND).
+
+| Query | Matches |
+|---|---|
+| `rust`, `"rust book"` | Title or alias contains the word / phrase (any case). This is what plain search text does. |
+| `/^20\d\d/` | Title or alias matches the regex (any case; `(?-i)` turns case back on) |
+| `title:TEXT`, `title:/re/` | Title only |
+| `alias:TEXT` | An alias |
+| `tag:X`, `tag:/re/` | Has tag `X` (whole tag, any case) |
+| `dir:PATH` | File is in folder `PATH` or below it, relative to the notes root (`dir:posts` matches `posts/a.org` and `posts/2026/b.org`, never `postscript/`). Whole folder names only; `/` or `\`; an absolute path works too. |
+| `path:TEXT` | Full file path contains `TEXT` |
+| `file:TEXT` | File name contains `TEXT` |
+| `level:0`, `level:>0` | File nodes / heading nodes (`=N`, `>N`, `<N`, `>=N`, `<=N`) |
+| `degree:>N` | More than N links (`=N`, `<N`, ...; counts every real link in the db) |
+| `prop:KEY`, `prop:KEY=VALUE` | Has an org property (any case; `prop:"KEY=two words"`) |
+| `daily` | A daily note |
+| `orphan` | No link to anything in the current view (for groups: before group hiding) |
+| `dangling` | Has a link to a missing node or an unresolved `[[title]]` |
+| `A OR B`, `A AND B`, `NOT A`, `-A` | Either, both, neither. `AND` binds tighter than `OR`; `-` works on a term or a group: `-(tag:a OR tag:b)` |
+| `( ... )` | Grouping |
+
+Operators are upper case (`and`, `or`, `not` are ordinary words). A word whose part before `:` isn't one of the keys above is plain text, so `http://x` or `Rust:` search titles as before. While the query doesn't parse, nothing fades and the status bar shows the problem and its column (`col 8: OR needs a term on both sides`). `Enter` jumps to the first visible match, preferring a title that starts with the first search word.
+
+---
+
 ## Opening nodes in Emacs
 
 Double-click a node (or select it and press `Enter` / `Space`). File nodes open the file; **headline nodes jump to the heading** via `goto-char`.
@@ -110,7 +203,7 @@ GUI apps get a minimal `PATH`, so Navi resolves `emacsclient` to an absolute pat
 
 - Unix (socket): `$EMACS_SOCKET_NAME` / `$EMACS_SERVER_SOCKET`, `$XDG_RUNTIME_DIR/emacs/`, `$TMPDIR/emacs{uid}/`, `/tmp`, `/private/tmp` (covers the macOS GUI-vs-Terminal `TMPDIR` mismatch)
 - Unix (TCP mode): `$EMACS_SERVER_FILE`, `~/.emacs.d/server/`, `$XDG_CONFIG_HOME/emacs/server/`
-- Windows (always TCP): `$EMACS_SERVER_FILE`, then `.emacs.d/server/` and `.config/emacs/server/` under `%HOME%`, `%APPDATA%`, `%USERPROFILE%` — passed via `--server-file`
+- Windows (always TCP): `$EMACS_SERVER_FILE`, then `.emacs.d/server/` and `.config/emacs/server/` under `%HOME%`, `%APPDATA%`, `%USERPROFILE%`, passed via `--server-file`
 
 If open fails, an error appears in the status bar. Make sure Emacs has `(server-start)` in its init.
 
@@ -124,18 +217,21 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | Swipe + release | Kinetic pan (momentum) |
 | Drag node | Move node |
 | Scroll / trackpad | Zoom toward cursor |
-| Click node | Select — highlights connections |
+| Click node | Select, highlights connections (the status bar lists its groups) |
 | Double-click node | Open in Emacs |
 | `Tab` / `Shift-Tab` | Cycle visible nodes |
 | `Enter` / `Space` | Open selected node |
 | `T` | Cycle colour theme |
-| `G` | Toggle tag colouring |
+| `G` | Group display on / off (colours, hulls, pull, legend) |
+| `Shift-G` | Cycle the automatic grouper: none → folder → tag → component → community → file |
+| `1` to `9` | Switch to view 1 to 9 |
+| `[` / `]` | Previous / next view |
 | `A` | Toggle age / weathering heatmap |
-| `D` | Show / hide daily notes (saved to config) |
-| `O` | Cycle orphans: shown → hidden → only (saved to config) |
+| `D` | Show / hide daily notes (saved in the view) |
+| `O` | Cycle orphans: shown → hidden → only (saved in the view) |
 | `L` | Cycle local-graph mode (1 → 2 → 3 hops → off) |
 | `V` | Cycle layout algorithm |
-| `/` | Search by title or alias |
+| `/` | Search with the [query language](#query-language); plain words search titles and aliases |
 | `W` | Reload graph from database |
 | `F` | Toggle FPS counter |
 | `P` | Pause / resume physics |
@@ -147,11 +243,11 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 
 ## Frame pacing
 
-Mouse / keyboard events do **not** trigger paints on any platform — a per-platform vsync source is the sole paint signal, which eliminates the multi-paint-per-frame burn that input-driven loops produce. After ~10 s of inactivity (configurable with `NAVI_IDLE_GRACE_SECS`) the app drops to a ~30 fps idle tier; the next input or focus event restores full speed within a frame.
+Mouse / keyboard events do **not** trigger paints on any platform: a per-platform vsync source is the sole paint signal, which eliminates the multi-paint-per-frame burn that input-driven loops produce. After ~10 s of inactivity (configurable with `NAVI_IDLE_GRACE_SECS`) the app drops to a ~30 fps idle tier; the next input or focus event restores full speed within a frame.
 
-- **macOS** — a dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`; each vsync sends a `UserEvent::Vsync` to the main thread. `swap_buffers` uses `SwapInterval::DontWait` because macOS GL caps swap-vsync at ~108 Hz on ProMotion panels regardless of tier — the display link does the pacing.
-- **Linux/X11 & Windows** — vsync-blocking swaps (`SwapInterval::Wait(1)`): each paint re-arms the next `request_redraw`, and the blocking swap throttles the loop to the monitor's refresh rate.
-- **Linux/Wayland** — swaps never block (compositors stop frame callbacks for hidden surfaces, which would freeze a blocking swap); a `WaitUntil` timer paces at the monitor's reported refresh rate instead. When the window is fully occluded (macOS occlusion state, X11 visibility events) painting stops entirely.
+- **macOS**: a dedicated background thread owns a `CADisplayLink` pinned to the panel's max refresh rate via `CAFrameRateRange`; each vsync sends a `UserEvent::Vsync` to the main thread. `swap_buffers` uses `SwapInterval::DontWait` because macOS GL caps swap-vsync at ~108 Hz on ProMotion panels regardless of tier; the display link does the pacing.
+- **Linux/X11 & Windows**: vsync-blocking swaps (`SwapInterval::Wait(1)`): each paint re-arms the next `request_redraw`, and the blocking swap throttles the loop to the monitor's refresh rate.
+- **Linux/Wayland**: swaps never block (compositors stop frame callbacks for hidden surfaces, which would freeze a blocking swap); a `WaitUntil` timer paces at the monitor's reported refresh rate instead. When the window is fully occluded (macOS occlusion state, X11 visibility events) painting stops entirely.
 
 Result on a 240 Hz display (macOS): 4.17 ms average frame interval, worst-case 5–7 ms (no missed vsyncs in steady state), and the application sits near 0 % CPU when idle.
 
@@ -173,18 +269,22 @@ Result on a 240 Hz display (macOS): 4.17 ms average frame interval, worst-case 5
 
 ```
 Cargo.toml                Workspace root
-navi-core/                Pure-Rust library: config, org-roam DB loader, view pipeline, graph + physics
+navi-core/                Pure-Rust library: config, org-roam DB loader, view pipeline, groups, graph + physics
   src/lib.rs
-  src/config.rs           Config load/save, db detection, path expansion
-  src/db.rs               org-roam.db loader: link typing, dedupe, dangling links, containment
+  src/config.rs           Config load/save (tolerant, atomic), db detection, path expansion
+  src/db.rs               org-roam.db loader: link typing, dedupe, dangling links, containment, properties
   src/emacs.rs            emacsclient + socket discovery
-  src/view.rs             Dailies / orphan filters → visible nodes + edges, orphan counts
-  src/graph.rs            Force-directed physics + layouts over the visible subset
-  tests/probe_real_db.rs  #[ignore]d read-only probe of your real org-roam.db
+  src/view.rs             Dailies / group / orphan filters → visible nodes + edges, orphan counts
+  src/query.rs            The query language: lexer, parser, evaluator
+  src/groups.rs           Manual + automatic groups, precedence, hiding, stable colours, hulls
+  src/community.rs        Deterministic community detection (Louvain + connectivity refinement)
+  src/views.rs            Named views per db in views.json, migration from config.json
+  src/graph.rs            Force-directed physics (with group pull) + layouts over the visible subset
+  tests/probe_real_db.rs  #[ignore]d read-only probes of your real org-roam.db (filters, groups)
 navi/                     Binary: UI, rendering, event loop
   src/main.rs             winit + glutin event loop, paint pacer
-  src/app.rs              egui app: input, layout, status bar
-  src/painter.rs          GraphPainter — grid, edges, nodes, labels
+  src/app.rs              egui app: input, layout, views, search, status bar, legend
+  src/painter.rs          GraphPainter: grid, group hulls, edges, nodes, labels
   src/macos_display.rs    macOS CADisplayLink + tier control
   src/theme.rs            Colour themes
 scripts/build-macos.sh    Cargo build + Navi.app + zip for release

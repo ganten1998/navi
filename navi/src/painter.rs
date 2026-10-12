@@ -1,5 +1,5 @@
-use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2, epaint::FontId};
-use navi_core::{Graph, Node};
+use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, epaint::FontId};
+use navi_core::{groups::{centroid, padded_hull}, Graph};
 use crate::theme::Theme;
 
 // ── Age ───────────────────────────────────────────────────────────────────────
@@ -69,6 +69,14 @@ fn dim(c: Color32, amt: u8) -> Color32 {
 
 // ── Painter ───────────────────────────────────────────────────────────────────
 
+/// A group whose hull is drawn: its colour, label and member nodes (the
+/// painter re-checks visibility and takes positions fresh each frame).
+pub struct HullDraw {
+    pub colour:  Color32,
+    pub label:   String,
+    pub members: Vec<usize>,
+}
+
 pub struct GraphPainter<'a> {
     pub graph:      &'a Graph,
     pub theme:      Theme,
@@ -78,7 +86,8 @@ pub struct GraphPainter<'a> {
     pub selected:   Option<usize>,
     pub faded:      &'a [bool],      // search / local-graph fade, per node
     pub hov_adj:    &'a [bool],      // hovered node + its visible neighbours, per node
-    pub show_tags:  bool,
+    pub node_colours: &'a [Option<Color32>], // group colour per node (None: the theme's node colour)
+    pub hulls:      &'a [HullDraw],
     pub show_age:   bool,
     pub now_secs:   f64,
     pub graph_rect: Rect,
@@ -99,26 +108,18 @@ impl<'a> GraphPainter<'a> {
          ((sy - cy - self.pan.y) / self.zoom) as f64)
     }
 
-    fn node_base_colors(&self, nd: &Node) -> (Color32, Color32) {
+    fn node_base_colors(&self, idx: usize) -> (Color32, Color32) {
         let t = &self.theme;
-        if self.show_tags && !nd.tags.is_empty() {
-            if let Some(&tc) = self.graph.tag_colors.get(&nd.tags[0]) {
-                let body = Color32::from_rgb(tc[0], tc[1], tc[2]);
-                let rim  = Color32::from_rgb(
-                    (tc[0] as u16 + 38).min(255) as u8,
-                    (tc[1] as u16 + 38).min(255) as u8,
-                    (tc[2] as u16 + 38).min(255) as u8,
-                );
-                return (body, rim);
-            }
+        if let Some(Some(c)) = self.node_colours.get(idx) {
+            return (*c, brighten(*c, 0.22));
         }
         (t.node, t.node_rim)
     }
 
-    fn node_colors(&self, nd: &Node, is_sel: bool, is_hov: bool, is_fade: bool) -> (Color32, Color32) {
+    fn node_colors(&self, idx: usize, is_sel: bool, is_hov: bool, is_fade: bool) -> (Color32, Color32) {
         let t = &self.theme;
         if is_hov && !is_sel { return (t.node_rim, t.node_hov); }
-        let (body, rim) = self.node_base_colors(nd);
+        let (body, rim) = self.node_base_colors(idx);
         if is_fade { return (dim(rim, 70), dim(body, 70)); }
         (rim, body)
     }
@@ -142,6 +143,33 @@ impl<'a> GraphPainter<'a> {
         while y <= rect.bottom() + sp {
             painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], s);
             y += sp;
+        }
+    }
+
+    /// Faint padded convex hulls behind the nodes, one per group with its
+    /// hull on, over the group's visible members; the label sits at the
+    /// members' centroid. The padding covers node radius plus the breathing
+    /// wobble (4 px on screen).
+    pub fn paint_hulls(&self, painter: &Painter) {
+        let r   = self.graph_rect.expand(40.0);
+        let pad = (navi_core::graph::R_MAX as f64 + 10.0) + 6.0 / self.zoom.max(0.01) as f64;
+        for h in self.hulls {
+            let pts: Vec<(f64, f64)> = h.members.iter().copied().filter(|&i| self.graph.is_visible(i))
+                .map(|i| (self.graph.node_list[i].x, self.graph.node_list[i].y)).collect();
+            if pts.is_empty() { continue; }
+            let poly: Vec<Pos2> = padded_hull(&pts, pad, 16).into_iter().map(|(x, y)| self.w2s(x, y)).collect();
+            let bb = Rect::from_points(&poly);
+            if !bb.intersects(r) { continue; }
+            let c = h.colour;
+            painter.add(Shape::convex_polygon(poly,
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 20),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 70))));
+            if self.zoom > 0.12 {
+                if let Some((cx, cy)) = centroid(&pts) {
+                    painter.text(self.w2s(cx, cy), egui::Align2::CENTER_CENTER, &h.label, FontId::proportional(15.0),
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110));
+                }
+            }
         }
     }
 
@@ -190,7 +218,7 @@ impl<'a> GraphPainter<'a> {
             let is_fade = self.faded.get(node_idx).copied().unwrap_or(false)
                 || (self.hovered.is_some() && !self.hov_adj.get(node_idx).copied().unwrap_or(false) && !is_sel && !is_hov);
 
-            let (rim_col, body_col) = self.node_colors(nd, is_sel, is_hov, is_fade);
+            let (rim_col, body_col) = self.node_colors(node_idx, is_sel, is_hov, is_fade);
 
             // Age parameter — bypassed for selected/hovered so they always read true colour
             let age_t = if !is_sel && !is_hov && self.show_age && nd.mtime > 0 {

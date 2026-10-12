@@ -6,6 +6,36 @@ All notable changes to Navi are documented here.
 
 ### Added
 
+- **Groups**: a group is a query with a colour and three switches:
+  visible, pull (members drift toward their centroid; off by default) and
+  hull (a faint outline behind its nodes). Manual groups are an ordered
+  list where the first visible match colours a node, and a node keeps every
+  group it's in (the status bar lists them for the selected node). One
+  automatic grouper can run below them: folder (relative to the notes
+  root), tag (first tag alphabetically), component, community (Louvain with
+  a connectivity refinement: deterministic, seeded, computed in the
+  background on large graphs) or file (headings with their file). Hiding a
+  group hides only nodes whose every group is hidden, and it happens before
+  orphans are worked out, like the dailies filter.
+- **Stable group colours**, readable on every theme: manual groups store
+  theirs, folder/tag/file groups keep a remembered palette slot per name
+  (a new tag never repaints an old one), and components/communities keep
+  theirs across recomputation by overlap matching. Ungrouped nodes and
+  orphans keep the theme's node colour.
+- **Query language** for the search box and group queries: `tag:`, `dir:`,
+  `path:`, `file:`, `title:` (text or `/regex/`), `alias:`, `level:`,
+  `degree:`, `prop:KEY=VAL`, `daily`, `orphan`, `dangling`, `AND` / `OR` /
+  `NOT` / `-`, parentheses and quoted phrases. Plain words still search
+  titles and aliases. A query that doesn't parse shows its error and column
+  in the status bar; while typing, the status bar counts matches.
+- **Views**: named sets of groups and filters per db in
+  `~/.config/navi/views.json`; `1` to `9` and `[` / `]` switch between them,
+  and the last one used is remembered. Loading keeps everything that
+  parses (a bad entry is dropped alone, and the original file is copied to
+  `views.json.bad` first); saves are atomic.
+- `Shift-G` cycles the automatic grouper; a legend (top left) lists the
+  groups with how many of their nodes are on screen while groups are shown.
+
 - **Orphan filter is tri-state**: `O` cycles shown → hidden → only. The
   status bar shows the mode and counts when it isn't "shown"
   (`Orphans:Hidden 13 (2 isolated by filters)`); the `H` panel shows orphan
@@ -23,6 +53,19 @@ All notable changes to Navi are documented here.
   and counted (help panel, startup log).
 - Heading nodes record their file node (containment, for future grouping;
   not drawn, not a link).
+
+### Changed
+
+- `G` toggles the group display (colours, hulls, pull, legend) instead of
+  colouring by each node's first tag in database order with colours handed
+  out by index. With nothing grouped yet, the first `G` turns on the tag
+  grouper, so it still does what it used to.
+- The `dailies`, `orphans` and `links_to_dailies_count` settings moved from
+  `config.json` into the active view. Existing values carry over on the
+  first run, and leave `config.json` only after `views.json` holding them
+  is written. `config.json` is now saved atomically too.
+- Group pull is weak by default (`group_pull: 0.1`) so links between groups
+  stay readable; it pauses like the rest of the physics once things settle.
 
 ### Fixed
 

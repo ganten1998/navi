@@ -26,7 +26,9 @@ use winit::window::Window;
 
 use navi_core::{
     config::{detect_db, expand_tilde, Config},
-    load_graph, Graph,
+    load_graph,
+    views::{db_key, ViewStore},
+    Graph,
 };
 
 /// Cross-thread events delivered to winit's main event loop.
@@ -79,6 +81,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let db_path = expand_tilde(&cfg.db);
 
+    // Views (groups + filters) live in views.json per canonical db path. The
+    // first time a db has none, its Default view takes the filter keys an
+    // older config.json carried; those leave config.json only once
+    // views.json holding them is safely written.
+    let mut views = ViewStore::load(&ViewStore::default_path());
+    let key = db_key(&db_path);
+    let legacy = cfg.legacy_view();
+    if views.ensure_db(&key, legacy.as_ref()) {
+        match views.save() {
+            Ok(()) => if legacy.is_some() { cfg.clear_legacy_view(); },
+            Err(e) => eprintln!("navi: couldn't write {}: {e}", views.path.display()),
+        }
+    }
+    let filter = views.active(&key).filter(&cfg.dailies_dirs);
+
     // A missing/unreadable db must not kill the app before a window exists —
     // double-clicking the binary would just silently do nothing. Open with an
     // empty graph and say where we looked; `W` re-reads the db once it exists.
@@ -90,12 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data.nodes.len(), data.edges.len(), s.duplicates, s.self_links, data.dangling.len(),
             );
             // laid out for the saved filter: one layout, of what's on screen
-            (Graph::from_data_with_view(data, &cfg.view_filter()), None)
+            (Graph::from_data_with_view(data, &filter), None)
         }
         Err(e) => {
             eprintln!("navi: failed to load {db_path}: {e}");
             let msg = format!(
-                "No org-roam db at {db_path} — set \"db\" in {}, then press W to reload",
+                "No org-roam db at {db_path}. Set \"db\" in {}, then press W to reload",
                 Config::config_path().display()
             );
             (Graph::new(Vec::new(), Vec::new()), Some(msg))
@@ -107,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app_state = AppState::new(graph, cfg, db_path, proxy, startup_error);
+    let mut app_state = AppState::new(graph, cfg, db_path, (views, key), proxy, startup_error);
     event_loop.run_app(&mut app_state)?;
     Ok(())
 }
@@ -118,6 +135,7 @@ struct AppState {
     graph: Option<Graph>,
     cfg: Option<Config>,
     db_path: Option<String>,
+    views: Option<(ViewStore, String)>, // store + this db's key
     startup_error: Option<String>,
 
     // True while the OS reports the window fully hidden (macOS occlusion,
@@ -153,6 +171,7 @@ impl AppState {
         graph: Graph,
         cfg: Config,
         db_path: String,
+        views: (ViewStore, String),
         proxy: EventLoopProxy<UserEvent>,
         startup_error: Option<String>,
     ) -> Self {
@@ -161,6 +180,7 @@ impl AppState {
             graph: Some(graph),
             cfg: Some(cfg),
             db_path: Some(db_path),
+            views: Some(views),
             startup_error,
             occluded: false,
             gl_window: None,
@@ -215,7 +235,8 @@ impl ApplicationHandler<UserEvent> for AppState {
         let graph = self.graph.take().expect("graph initialised in main()");
         let cfg = self.cfg.take().expect("cfg initialised in main()");
         let db_path = self.db_path.take().expect("db_path initialised in main()");
-        let mut app = app::NaviApp::new(graph, cfg, db_path);
+        let (views, key) = self.views.take().expect("views initialised in main()");
+        let mut app = app::NaviApp::new(graph, cfg, db_path, views, key);
         if let Some(msg) = self.startup_error.take() {
             app.set_startup_error(msg);
         }

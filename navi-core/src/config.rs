@@ -1,7 +1,8 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use crate::view::{default_dailies_dirs, DailiesMode, OrphansMode, ViewFilter};
+use crate::view::{default_dailies_dirs, DailiesMode, OrphansMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -15,15 +16,24 @@ pub struct Config {
     pub show_fps: bool,
     #[serde(default)]
     pub borderless: bool,
-    // ── view filters (D / O persist here) ──
-    #[serde(default)]
-    pub dailies: DailiesMode,                // "show" | "hide"
-    #[serde(default)]
-    pub orphans: OrphansMode,                // "show" | "hide" | "only"
     #[serde(default = "default_dailies_dirs")]
     pub dailies_dirs: Vec<String>,           // directory names that mark a daily note
-    #[serde(default = "default_true")]
-    pub links_to_dailies_count: bool,        // false: a link to a daily doesn't save a note from orphanhood
+    // ── legacy view filters: moved into views.json (views.rs). Read so the
+    // first run can seed a db's first view from them, then dropped. ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dailies: Option<DailiesMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphans: Option<OrphansMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_to_dailies_count: Option<bool>,
+}
+
+/// The view filters an older config.json carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyView {
+    pub dailies:                Option<DailiesMode>,
+    pub orphans:                Option<OrphansMode>,
+    pub links_to_dailies_count: Option<bool>,
 }
 
 fn default_server() -> String { "server".into() }
@@ -37,22 +47,30 @@ impl Default for Config {
             server_name: "server".into(),
             show_fps: true,
             borderless: false,
-            dailies: DailiesMode::Show,
-            orphans: OrphansMode::Show,
             dailies_dirs: default_dailies_dirs(),
-            links_to_dailies_count: true,
+            dailies: None,
+            orphans: None,
+            links_to_dailies_count: None,
         }
     }
 }
 
 impl Config {
-    pub fn view_filter(&self) -> ViewFilter {
-        ViewFilter {
-            dailies:                self.dailies,
-            orphans:                self.orphans,
-            dailies_dirs:           self.dailies_dirs.clone(),
-            links_to_dailies_count: self.links_to_dailies_count,
-        }
+    /// The pre-views filter keys, when the file still has any.
+    pub fn legacy_view(&self) -> Option<LegacyView> {
+        let l = LegacyView { dailies: self.dailies, orphans: self.orphans, links_to_dailies_count: self.links_to_dailies_count };
+        (l != LegacyView::default()).then_some(l)
+    }
+
+    /// Forget the legacy keys (once a view holds them).
+    pub fn clear_legacy_view(&mut self) {
+        self.dailies = None;
+        self.orphans = None;
+        self.links_to_dailies_count = None;
+    }
+
+    pub fn config_dir() -> PathBuf {
+        dirs::home_dir().unwrap_or_default().join(".config").join("navi")
     }
 
     pub fn config_path() -> PathBuf {
@@ -63,14 +81,13 @@ impl Config {
             .join("config.json")
     }
 
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        if path.exists() {
-            if let Ok(s) = std::fs::read_to_string(&path) {
-                return Self::parse(&s);
-            }
+    pub fn load() -> Self { Self::load_from(&Self::config_path()) }
+
+    pub fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(s)  => Self::parse(&s),
+            Err(_) => Config::default(),
         }
-        Config::default()
     }
 
     /// Parse config.json. One bad value must not cost every other setting
@@ -78,31 +95,58 @@ impl Config {
     /// back to its default alone, the rest are kept.
     pub fn parse(s: &str) -> Self {
         if let Ok(c) = serde_json::from_str(s) { return c; }
-        let Ok(serde_json::Value::Object(user)) = serde_json::from_str::<serde_json::Value>(s) else {
-            return Config::default();
-        };
-        let mut kept = serde_json::Map::new();
-        for (k, v) in user {
-            let mut trial = kept.clone();
-            trial.insert(k.clone(), v.clone());
-            if serde_json::from_value::<Config>(serde_json::Value::Object(trial)).is_ok() {
-                kept.insert(k, v);
-            } else {
-                eprintln!("navi: config.json: ignoring bad value for \"{k}\" (using the default)");
-            }
+        match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(user)) => parse_tolerant(user, "config.json").0,
+            _ => Config::default(),
         }
-        serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default()
     }
 
-    pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, s);
+    pub fn save(&self) { let _ = self.save_to(&Self::config_path()); }
+
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let s = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        atomic_write(path, &s)
+    }
+}
+
+/// Deserialize `user` as a `T`, keeping every key whose value parses and
+/// dropping (to its default) each one that doesn't, with a note on stderr.
+/// Returns the value and whether anything was dropped.
+pub fn parse_tolerant<T: DeserializeOwned + Default>(user: serde_json::Map<String, serde_json::Value>, what: &str) -> (T, bool) {
+    if let Ok(t) = serde_json::from_value(serde_json::Value::Object(user.clone())) { return (t, false); }
+    let mut kept    = serde_json::Map::new();
+    let mut dropped = false;
+    for (k, v) in user {
+        let mut trial = kept.clone();
+        trial.insert(k.clone(), v.clone());
+        if serde_json::from_value::<T>(serde_json::Value::Object(trial)).is_ok() {
+            kept.insert(k, v);
+        } else {
+            eprintln!("navi: {what}: ignoring bad value for \"{k}\" (using the default)");
+            dropped = true;
         }
     }
+    (serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default(), dropped)
+}
+
+/// Write `data` to `path` all at once: a temp file in the same directory,
+/// flushed, then renamed over the target. A crash mid-save leaves the old
+/// file, never half of the new one.
+pub fn atomic_write(path: &Path, data: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "navi".into());
+    let tmp  = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    };
+    let r = write();
+    if r.is_err() { let _ = std::fs::remove_file(&tmp); }
+    r
 }
 
 // ── DB path detection ─────────────────────────────────────────────────────────
@@ -172,7 +216,8 @@ mod tests {
                        "server_name": "server", "show_fps": true, "borderless": false }"#;
         let c: Config = serde_json::from_str(old).unwrap();
         assert_eq!(c.db, "~/.emacs.d/org-roam.db");
-        assert_eq!(c.view_filter(), ViewFilter::default());
+        assert_eq!(c.legacy_view(), None);
+        assert_eq!(c.dailies_dirs, default_dailies_dirs());
     }
 
     /// A hand edit with a bad value (e.g. the UI's own word for a mode, or a
@@ -186,20 +231,42 @@ mod tests {
         assert_eq!((c.db.as_str(), c.emacsclient.as_str(), c.server_name.as_str()), ("/x.db", "/e", "work"));
         assert!(c.borderless && !c.show_fps);
         assert_eq!(c.dailies_dirs, vec!["log"]);
-        assert_eq!(c.dailies, DailiesMode::Hide, "UI word accepted");
-        assert_eq!(c.orphans, OrphansMode::Show, "bad value → default");
-        assert!(c.links_to_dailies_count, "bad type → default");
-        assert_eq!(Config::parse(r#"{"orphans": "hidden"}"#).orphans, OrphansMode::Hide);
+        assert_eq!(c.dailies, Some(DailiesMode::Hide), "UI word accepted");
+        assert_eq!(c.orphans, None, "bad value → default");
+        assert_eq!(c.links_to_dailies_count, None, "bad type → default");
+        assert_eq!(Config::parse(r#"{"orphans": "hidden"}"#).orphans, Some(OrphansMode::Hide));
         assert_eq!(Config::parse("not json").server_name, "server");
     }
 
+    /// Phase-1 view keys are read (to seed views.json) and dropped once
+    /// cleared; a config without them never writes them.
     #[test]
-    fn view_fields_round_trip() {
-        let c = Config { dailies: DailiesMode::Hide, orphans: OrphansMode::Only,
-                         dailies_dirs: vec!["log".into()], links_to_dailies_count: false, ..Config::default() };
+    fn legacy_view_fields_round_trip_then_clear() {
+        let mut c = Config::parse(r#"{"dailies": "hide", "orphans": "only", "links_to_dailies_count": false, "dailies_dirs": ["log"]}"#);
+        assert_eq!(c.legacy_view(), Some(LegacyView {
+            dailies: Some(DailiesMode::Hide), orphans: Some(OrphansMode::Only), links_to_dailies_count: Some(false) }));
         let s = serde_json::to_string(&c).unwrap();
-        assert!(s.contains("\"orphans\":\"only\"") && s.contains("\"dailies\":\"hide\""));
-        let back: Config = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.view_filter(), c.view_filter());
+        assert!(s.contains("\"orphans\":\"only\"") && s.contains("\"dailies\":\"hide\""), "kept until consumed");
+        c.clear_legacy_view();
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(!s.contains("orphans") && !s.contains("\"dailies\"") && !s.contains("links_to"), "{s}");
+        assert!(s.contains("dailies_dirs"));
+        assert!(!serde_json::to_string(&Config::default()).unwrap().contains("orphans"));
+    }
+
+    #[test]
+    fn atomic_save_and_load_in_a_temp_dir() {
+        let dir = std::env::temp_dir().join(format!("navi-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sub").join("config.json");
+        let c = Config { db: "/x.db".into(), borderless: true, ..Config::default() };
+        c.save_to(&path).unwrap();
+        let back = Config::load_from(&path);
+        assert_eq!((back.db.as_str(), back.borderless), ("/x.db", true));
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-")).collect();
+        assert!(leftovers.is_empty(), "temp file renamed away");
+        assert_eq!(Config::load_from(&dir.join("missing.json")).server_name, "server");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
