@@ -40,15 +40,57 @@ use navi_core::{
 #[derive(Debug)]
 pub enum UserEvent {
     Vsync,
+    /// A line from org-roam-navi.el on stdin (`--emacs`).
+    Emacs(navi_core::bridge::Command),
+}
+
+/// Command line. Navi needs none to run; org-roam-navi.el starts it with
+/// `--emacs --db PATH`.
+#[derive(Default)]
+struct Args {
+    emacs: bool,
+    db: Option<String>,
+}
+
+fn parse_args() -> Args {
+    let mut args = Args::default();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--emacs" => args.emacs = true,
+            "--db" => args.db = it.next(),
+            "-V" | "--version" => {
+                println!("navi {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                println!(
+                    "navi {}: an org-roam graph viewer\n\n\
+                     usage: navi [--db PATH] [--emacs]\n\n  \
+                     --db PATH   read this org-roam.db (this run only; config.json keeps its own)\n  \
+                     --emacs     started by org-roam-navi.el: JSON lines on stdin/stdout\n  \
+                     -V          print the version",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            // macOS hands a Finder-launched app `-psn_...`; ignore what we don't know
+            other => eprintln!("navi: ignoring argument {other:?}"),
+        }
+    }
+    args
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_args();
+
     // GUI-subsystem builds have no std handles; if we were launched from a
     // terminal, glue stderr back to it so the NAVI_* debug flags still print.
+    // Not under Emacs: there stdin/stdout are Emacs's pipes and must stay so.
     #[cfg(all(windows, not(debug_assertions)))]
-    unsafe {
+    if !args.emacs {
         use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
     }
 
     // A GUI-subsystem process that panics (GL bring-up failure, driver
@@ -79,7 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .binary
             .clone();
     }
-    let db_path = expand_tilde(&cfg.db);
+    // --db is for this run: config.json keeps the db it names
+    let db_path = expand_tilde(args.db.as_deref().unwrap_or(&cfg.db));
 
     // Views (groups + filters) live in views.json per canonical db path. The
     // filter keys an older config.json carried move to views.json
@@ -125,10 +168,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    if args.emacs { spawn_emacs_reader(proxy.clone()); }
 
     let mut app_state = AppState::new(graph, cfg, db_path, (views, key), proxy, startup_error);
+    app_state.emacs = args.emacs;
     event_loop.run_app(&mut app_state)?;
     Ok(())
+}
+
+/// Read org-roam-navi.el's commands off stdin, one JSON object per line, and
+/// wake the event loop with each. EOF means Emacs is gone (it quit, crashed,
+/// or killed the process): quit too, so navi never outlives its Emacs.
+fn spawn_emacs_reader(proxy: EventLoopProxy<UserEvent>) {
+    use navi_core::bridge::{parse_command, Command};
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() { continue; }
+            match parse_command(&line) {
+                Ok(cmd) => if proxy.send_event(UserEvent::Emacs(cmd)).is_err() { return; },
+                Err(e) => eprintln!("navi: {e}"),
+            }
+        }
+        let _ = proxy.send_event(UserEvent::Emacs(Command::Quit));
+    });
 }
 
 /// All runtime state owned by the winit `ApplicationHandler`.
@@ -139,6 +203,7 @@ struct AppState {
     db_path: Option<String>,
     views: Option<(ViewStore, String)>, // store + this db's key
     startup_error: Option<String>,
+    emacs: bool, // --emacs: started by org-roam-navi.el
 
     // True while the OS reports the window fully hidden (macOS occlusion,
     // X11 VisibilityNotify). Windows/Wayland never emit it — stays false there.
@@ -188,6 +253,7 @@ impl AppState {
             db_path: Some(db_path),
             views: Some(views),
             startup_error,
+            emacs: false,
             occluded: false,
             gl_window: None,
             gl: None,
@@ -253,6 +319,10 @@ impl ApplicationHandler<UserEvent> for AppState {
         let mut app = app::NaviApp::new(graph, cfg, db_path, views, key);
         if let Some(msg) = self.startup_error.take() {
             app.set_startup_error(msg);
+        }
+        if self.emacs {
+            app.set_emacs_mode(true);
+            app::emit_to_emacs(&navi_core::bridge::hello_event(env!("CARGO_PKG_VERSION")));
         }
 
         self.gl_window = Some(gl_window);
@@ -368,6 +438,29 @@ impl ApplicationHandler<UserEvent> for AppState {
                 // window and produces a 8–12 ms outlier (visible micro-stutter).
                 self.redraw(event_loop);
             }
+            UserEvent::Emacs(navi_core::bridge::Command::Quit) => event_loop.exit(),
+            UserEvent::Emacs(navi_core::bridge::Command::Raise) => {
+                if let Some(gw) = self.gl_window.as_ref() {
+                    gw.window().set_minimized(false);
+                    gw.window().focus_window();
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+                    #[allow(deprecated)]
+                    objc2_app_kit::NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+                }
+            }
+            UserEvent::Emacs(cmd) => {
+                if let Some(app) = self.app.as_mut() {
+                    app.emacs_command(cmd);
+                }
+                // idle: paint now (a glide then holds the full rate itself)
+                if self.next_idle_wake.is_some() {
+                    if let Some(gw) = self.gl_window.as_ref() {
+                        gw.window().request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -384,6 +477,9 @@ impl ApplicationHandler<UserEvent> for AppState {
         // views.json saves are debounced: write a pending edit before going
         if let Some(app) = self.app.as_mut() {
             app.shutdown();
+        }
+        if self.emacs {
+            app::emit_to_emacs(&navi_core::bridge::bye_event());
         }
         if let Some(eg) = self.egui_glow.as_mut() {
             eg.destroy();

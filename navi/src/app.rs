@@ -23,6 +23,7 @@ const BASE_DT: f32 = 1.0 / 60.0;
 const STATUS_H: f32 = 30.0;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600); // views.json writes after the last edit
 const VIEWS_POLL:    Duration = Duration::from_millis(700); // how often views.json is checked for a hand edit
+const DB_POLL:       Duration = Duration::from_millis(1000); // how often org-roam.db is checked for a write
 
 
 pub struct NaviApp {
@@ -124,6 +125,16 @@ pub struct NaviApp {
     // Q/Escape sets this; main.rs routes it through event_loop.exit() so GL
     // teardown runs (a raw process::exit skips Drop and can upset drivers).
     quit_requested: bool,
+
+    // ── Emacs (`--emacs`: started by org-roam-navi.el, talking over stdio) ──
+    emacs_mode:   bool,                                 // open nodes over the pipe, not emacsclient
+    emacs_theme:  Option<Theme>,                        // Emacs's colours, the theme after THEMES
+    glide_to:     Option<usize>,                        // node the view is gliding to (a `show`)
+    pending_show: Option<(Option<String>, Option<String>)>, // a `show` waiting on a reload
+    db_stamp:     Option<Vec<Option<std::time::SystemTime>>>, // mtimes of the db and its -wal
+    db_polled_at: Instant,
+    reload_quiet: bool,                                 // a reload navi started itself: no status chatter
+    quiet_failures: u32,                                // quiet reloads failed in a row
 }
 
 impl NaviApp {
@@ -214,7 +225,16 @@ impl NaviApp {
             graph_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 870.0)),
             initial_fit_done: false,
             quit_requested: false,
+            emacs_mode: false,
+            emacs_theme: None,
+            glide_to: None,
+            pending_show: None,
+            db_stamp: None,
+            db_polled_at: Instant::now(),
+            reload_quiet: false,
+            quiet_failures: 0,
         };
+        app.db_stamp = Some(app.db_mtimes());
         // main.rs built the graph with Graph::from_data_with_view, so the
         // visible subset of a persisted filter is already laid out on its own.
         app.pin_root();
@@ -560,7 +580,13 @@ impl NaviApp {
         self.hov_key = Some(key);
     }
 
-    fn theme(&self) -> Theme { THEMES[self.theme_idx] }
+    fn theme(&self) -> Theme {
+        match (THEMES.get(self.theme_idx), self.emacs_theme) {
+            (Some(t), _) => *t,
+            (None, Some(t)) => t,
+            (None, None) => THEMES[0],
+        }
+    }
 
     // ── coordinate math (uses cached graph_rect) ──────────────────────────────
 
@@ -595,6 +621,7 @@ impl NaviApp {
     }
 
     fn fit_to_nodes(&mut self) {
+        self.glide_to = None;
         let nds = &self.graph.node_list;
         let vis = &self.graph.vis_idx;
         if vis.is_empty() { return; }
@@ -616,10 +643,15 @@ impl NaviApp {
     }
 
     fn open_node(&mut self, idx: usize) {
-        if let Some(nd) = self.graph.node_list.get(idx) {
-            if let Err(e) = self.emacs.open_node(nd) {
-                self.set_msg(e, Duration::from_secs(6));
-            }
+        let Some(nd) = self.graph.node_list.get(idx) else { return };
+        // started by Emacs: hand it the node over the pipe; that Emacs opens
+        // it, so neither a server nor an emacsclient path is needed
+        if self.emacs_mode {
+            emit_to_emacs(&navi_core::bridge::open_event(nd));
+            return;
+        }
+        if let Err(e) = self.emacs.open_node(nd) {
+            self.set_msg(e, Duration::from_secs(6));
         }
     }
 
@@ -648,6 +680,7 @@ impl NaviApp {
         matches.sort_by_key(|(_, starts, _, _)| !starts);
         match matches.first() {
             Some(&(idx, _, nx, ny)) => {
+                self.glide_to = None;
                 self.selected = Some(idx);
                 self.pan = Vec2::new(-(nx as f32) * self.zoom, -(ny as f32) * self.zoom);
             }
@@ -670,6 +703,7 @@ impl NaviApp {
     }
 
     fn fit_to_positions(&mut self, positions: &[(f64, f64)]) {
+        self.glide_to = None;
         // Visible nodes only: hidden ones keep (and report) wherever they were frozen.
         let vis = &self.graph.vis_idx;
         if vis.is_empty() || positions.len() != self.graph.node_list.len() { return; }
@@ -691,13 +725,45 @@ impl NaviApp {
     }
 
     fn reload(&mut self) {
+        self.reload_quiet = false;
+        self.start_reload();
+        self.set_msg("Reloading…".to_string(), Duration::from_secs(30));
+    }
+
+    /// The db changed on disk (org-roam saved a note): re-read it without a
+    /// "Reloading…" in the status bar. Only a change in the set of nodes is
+    /// reported.
+    fn reload_quietly(&mut self) {
+        if self.reload_pending.is_some() { return; }
+        self.reload_quiet = true;
+        self.start_reload();
+    }
+
+    fn start_reload(&mut self) {
         let db = self.db_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(load_graph(&db).map_err(|e| e.to_string()));
         });
         self.reload_pending = Some(rx);
-        self.set_msg("Reloading…".to_string(), Duration::from_secs(30));
+    }
+
+    /// Modification times of the db and its write-ahead log (org-roam's
+    /// sqlite may run in WAL mode, where a write touches only the -wal).
+    fn db_mtimes(&self) -> Vec<Option<std::time::SystemTime>> {
+        ["", "-wal"].iter()
+            .map(|sfx| std::fs::metadata(format!("{}{sfx}", self.db_path)).and_then(|m| m.modified()).ok())
+            .collect()
+    }
+
+    fn poll_db_file(&mut self) {
+        if self.db_polled_at.elapsed() < DB_POLL { return; }
+        self.db_polled_at = Instant::now();
+        let now = self.db_mtimes();
+        if self.db_stamp.as_ref() == Some(&now) { return; }
+        if self.reload_pending.is_some() { return; } // look again once this one lands
+        self.db_stamp = Some(now);
+        self.reload_quietly();
     }
 
     fn poll_reload(&mut self) {
@@ -709,6 +775,7 @@ impl NaviApp {
             self.reload_pending = None;
             match result {
                 Ok(data) => {
+                    self.quiet_failures = 0;
                     let mut new_graph = Graph::from_data(data);
                     new_graph.transplant_positions(&self.graph);
                     let added = new_graph.node_list.iter().filter(|n| !self.graph.nodes.contains_key(&n.id)).count();
@@ -719,15 +786,34 @@ impl NaviApp {
 
                     // ids are the only identity that survives a reload
                     let old_sel = self.selected.map(|i| self.graph.node_list[i].id.clone());
+                    let old_glide = self.glide_to.and_then(|i| self.graph.node_list.get(i)).map(|n| n.id.clone());
                     self.graph = new_graph;
                     self.hovered = None;
                     self.node_dragging = None;
                     self.last_click = None;
                     self.selected = old_sel.and_then(|s| self.graph.nodes.get(&s).copied());
+                    self.glide_to = old_glide.and_then(|s| self.graph.nodes.get(&s).copied());
                     self.pin_root();
                     self.view_dirty = true;
                     self.refresh_view();
-                    self.set_msg(format!("Reloaded: {nn} nodes  {ne} edges{diff}"), Duration::from_secs(3));
+                    if !self.reload_quiet || !diff.is_empty() {
+                        self.set_msg(format!("Reloaded: {nn} nodes  {ne} edges{diff}"), Duration::from_secs(3));
+                    }
+                    if let Some((id, file)) = self.pending_show.take() {
+                        self.show_node(id.as_deref(), file.as_deref(), false);
+                    }
+                }
+                // a write caught half-done (the db locked mid-save): the next
+                // polls retry, but a db that stays unreadable is said once and
+                // left alone until it changes again
+                Err(e) if self.reload_quiet => {
+                    self.quiet_failures += 1;
+                    if self.quiet_failures < 3 {
+                        self.db_stamp = None;
+                    } else {
+                        self.quiet_failures = 0;
+                        self.set_msg(format!("Reload failed: {e}"), Duration::from_secs(6));
+                    }
                 }
                 Err(e) => self.set_msg(format!("Reload failed: {e}"), Duration::from_secs(6)),
             }
@@ -742,7 +828,8 @@ impl NaviApp {
             // Cap at 6 s so a long-lived (pinned) status message doesn't hold
             // the renderer at full speed for its whole lifetime.
             || self.status_msg.as_ref().map_or(false, |(_, t, d)| t.elapsed() < (*d).min(Duration::from_secs(6)))
-            || self.reload_pending.is_some()
+            || (self.reload_pending.is_some() && !self.reload_quiet)
+            || self.glide_to.is_some()
             || self.grouping.community.pending()
     }
 
@@ -871,8 +958,9 @@ impl NaviApp {
                         match key {
                             Key::Q | Key::Escape => { self.quit_requested = true; }
                             Key::T => {
-                                self.theme_idx = (self.theme_idx + 1) % THEMES.len();
-                                self.popup = Some((THEMES[self.theme_idx].name.to_string(), self.now_secs));
+                                let n = THEMES.len() + self.emacs_theme.is_some() as usize;
+                                self.theme_idx = (self.theme_idx + 1) % n;
+                                self.popup = Some((self.theme().name.to_string(), self.now_secs));
                             }
                             Key::P => { self.toggle_physics(); }
                             Key::Backslash => {
@@ -1043,6 +1131,7 @@ impl NaviApp {
         if scroll.y.abs() > 0.1 {
             if let Some(hp) = hover_pos {
                 if !self.on_ui(ctx, hp) {
+                    self.glide_to = None;
                     let steps = (scroll.y / 20.0).clamp(-5.0, 5.0);
                     let factor = ZOOM_STEP.powf(steps);
                     let cx = self.graph_rect.center().x;
@@ -1311,6 +1400,7 @@ impl NaviApp {
     pub fn needs_full_speed(&self) -> bool {
         let actively_animating = self.graph.physics_on
             || self.graph.is_layout_animating()
+            || self.glide_to.is_some()
             || self.pan_vel.length_sq() > 4.0
             || self.pan_dragging
             || self.node_dragging.is_some();
@@ -1346,6 +1436,55 @@ impl NaviApp {
     /// Bumps the activity clock so the idle grace timer restarts.
     pub fn touch_input(&mut self) {
         self.last_active_at = Instant::now();
+    }
+
+    /// Started by org-roam-navi.el (`--emacs`): nodes open in that Emacs.
+    pub fn set_emacs_mode(&mut self, on: bool) { self.emacs_mode = on; }
+
+    /// A command from Emacs (raise and quit are main.rs's: they need the
+    /// window and the event loop).
+    pub fn emacs_command(&mut self, cmd: navi_core::bridge::Command) {
+        use navi_core::bridge::Command;
+        match cmd {
+            Command::Show { id, file } => self.show_node(id.as_deref(), file.as_deref(), true),
+            Command::Reload => self.reload(),
+            Command::Theme(p) => {
+                let first = self.emacs_theme.is_none();
+                self.emacs_theme = Some(crate::theme::from_emacs(&p));
+                // the first palette takes over the canvas; later ones (a
+                // theme switch in Emacs) repaint it only if it's still on
+                if first { self.theme_idx = THEMES.len(); }
+                self.visuals_for = None;
+                self.colours_key = None;
+                self.panel.autos = None;
+            }
+            Command::Raise | Command::Quit => {}
+        }
+    }
+
+    /// Select the node Emacs is on and glide to it. An id navi doesn't know
+    /// yet (a note created since the db was read) is looked up again after
+    /// one reload; meanwhile its file's node stands in, when there is one.
+    fn show_node(&mut self, id: Option<&str>, file: Option<&str>, may_reload: bool) {
+        // a newer show from Emacs replaces one still waiting on a reload
+        if may_reload { self.pending_show = None; }
+        let found = navi_core::bridge::resolve_show(&self.graph, id, file);
+        let exact = id.map_or(true, |id| self.graph.nodes.contains_key(id));
+        if !exact && may_reload {
+            self.pending_show = Some((id.map(str::to_string), file.map(str::to_string)));
+            self.reload_quietly();
+        }
+        let Some(i) = found else { return };
+        if !self.graph.is_visible(i) {
+            let title = self.graph.node_list[i].title.clone();
+            self.set_msg(format!("{title} is hidden in this view"), Duration::from_secs(4));
+            return;
+        }
+        // the replay after a reload leaves a view the user has moved since alone;
+        // a show from Emacs always brings the node back into the middle
+        if !may_reload && self.selected == Some(i) { return; }
+        self.selected = Some(i);
+        self.glide_to = Some(i);
     }
 
     /// True once the user pressed Q/Escape; main.rs exits the event loop.
@@ -1394,6 +1533,7 @@ impl NaviApp {
         // ── Updates ───────────────────────────────────────────────────────────
         self.poll_reload();
         self.poll_views_file();
+        self.poll_db_file();
 
         // Fixed 60 Hz physics — decoupled from render rate so vsync at any
         // frequency doesn't change how fast nodes move or how much CPU physics uses.
@@ -1402,6 +1542,19 @@ impl NaviApp {
         while self.physics_accumulator >= PHYS_DT {
             self.graph.step(PHYS_DT);
             self.physics_accumulator -= PHYS_DT;
+        }
+
+        // `show` from Emacs: ease the view onto the node, following it while
+        // physics moves it; any hand on the graph takes over
+        if self.pan_dragging || self.node_dragging.is_some() { self.glide_to = None; }
+        if let Some(i) = self.glide_to.filter(|&i| i < self.graph.node_list.len()) {
+            let nd = &self.graph.node_list[i];
+            let goal = Vec2::new(-(nd.x as f32) * self.zoom, -(nd.y as f32) * self.zoom);
+            self.pan += (goal - self.pan) * (8.0 * dt).min(1.0);
+            self.pan_vel = Vec2::ZERO;
+            if (goal - self.pan).length() < 0.5 { self.pan = goal; self.glide_to = None; }
+        } else {
+            self.glide_to = None;
         }
 
         if !self.pan_dragging && self.pan_vel.length() > 0.5 {
@@ -1553,7 +1706,7 @@ impl NaviApp {
             };
             if alpha > 0.01 {
                 let a  = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
-                let t  = THEMES[self.theme_idx];
+                let t  = self.theme();
                 let fid = egui::epaint::FontId::proportional(14.0);
                 let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground, egui::Id::new("popup"),
@@ -1607,4 +1760,12 @@ fn unix_now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// One event line to the Emacs that started navi. A closed pipe (Emacs gone)
+/// is ignored: stdin's EOF is what ends navi then.
+pub fn emit_to_emacs(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}").and_then(|_| out.flush());
 }

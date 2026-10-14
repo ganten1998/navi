@@ -2,6 +2,34 @@
 
 All notable changes to Navi are documented here.
 
+## [1.2.0] - 2026-10-14
+
+### Added
+
+- **Navi in Emacs: `org-roam-navi`** (`emacs/org-roam-navi.el`). One
+  `use-package` form, then `M-x org-roam-navi`: the first run downloads the
+  right Navi for the machine from the latest release and checks it against
+  `SHA256SUMS`. Started that way:
+  - the graph follows point: the note or heading you're in is selected and
+    the view glides to it (follows the node while physics moves it; any
+    drag or scroll takes over);
+  - opening a node (double-click, `Enter`) opens it in that Emacs, at the
+    heading, in the window you were last in. No `server-start` or
+    emacsclient needed;
+  - Navi draws with the Emacs theme (`default`, `org-link`, `shadow`,
+    `font-lock-keyword-face`, `warning`, `mode-line`) and follows theme
+    changes. Colours that wouldn't read on the canvas are replaced, so no
+    theme makes nodes or labels invisible. `T` cycles to Navi's own themes
+    and back;
+  - Navi quits with Emacs (stdin EOF), saving its views first.
+  Works from GUI and terminal frames alike.
+- `--emacs` and `--db PATH` flags, plus `--version` and `--help`. The
+  protocol (JSON lines on stdin/stdout) lives in `navi-core/src/bridge.rs`.
+- Navi re-reads the db by itself when it changes on disk (the db or its
+  `-wal`), quietly: the status bar only reports a change in the nodes.
+- **FreeBSD** release build (x86_64, cross-built with zig).
+- Releases carry `SHA256SUMS`.
+
 ## [1.1.0] - 2026-10-12
 
 ### Added

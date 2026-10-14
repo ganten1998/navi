@@ -260,6 +260,56 @@ pub const THEMES: &[Theme] = &[
     },
 ];
 
+/// The theme navi draws with when Emacs sends its colours (`--emacs` mode):
+/// the canvas is the `default` background, nodes wear the colour links have
+/// in your notes, the status bar is the mode line. A colour that wouldn't
+/// read on the canvas (or that Emacs didn't specify) is mixed from the
+/// foreground instead, so no Emacs theme can make the graph invisible.
+pub fn from_emacs(p: &navi_core::bridge::Palette) -> Theme {
+    use navi_core::groups::{contrast, luminance};
+    let bg = p.bg.unwrap_or([16, 30, 46]);
+    let light = luminance(bg) > 0.35;
+    let fg = p.fg.filter(|&c| contrast(c, bg) >= 4.5).unwrap_or(if light { [20, 20, 20] } else { [230, 230, 230] });
+    let mix = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] {
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+        [m(a[0], b[0]), m(a[1], b[1]), m(a[2], b[2])]
+    };
+    // last resort: walk toward black or white (whichever `on` is further
+    // from) until the colour reads
+    let ensure = |c: [u8; 3], on: [u8; 3], min: f64| -> [u8; 3] {
+        let pole = if luminance(on) > 0.18 { [0, 0, 0] } else { [255, 255, 255] };
+        (0..=10).map(|k| mix(c, pole, k as f32 / 10.0)).find(|&m| contrast(m, on) >= min).unwrap_or(pole)
+    };
+    // `want` if it reads on the canvas at `min`, else the fallback
+    let pick = |want: Option<[u8; 3]>, min: f64, fallback: [u8; 3]| {
+        want.filter(|&c| contrast(c, bg) >= min).unwrap_or_else(|| ensure(fallback, bg, min))
+    };
+    let accent = pick(p.accent, 3.0, mix(bg, fg, 0.75));
+    let node   = pick(p.link, 3.0, accent);
+    let warm   = pick(p.warm, 3.0, if light { [200, 90, 0] } else { [240, 144, 48] });
+    let dim    = pick(p.dim, 2.5, mix(bg, fg, 0.55));
+    let bar_bg = p.bar_bg.unwrap_or(mix(bg, fg, 0.06));
+    let bar_fg = p.bar_fg.filter(|&c| contrast(c, bar_bg) >= 3.0).unwrap_or_else(|| ensure(mix(bar_bg, fg, 0.8), bar_bg, 3.0));
+    let c = |v: [u8; 3]| Color32::from_rgb(v[0], v[1], v[2]);
+    Theme {
+        name: "Emacs",
+        bg:        c(bg),
+        grid:      c(mix(bg, fg, 0.07)),
+        edge:      c(mix(bg, accent, 0.4)),
+        edge_hi:   c(accent),
+        node:      c(node),
+        node_rim:  c(mix(node, fg, 0.45)),
+        node_hov:  c(mix(accent, fg, 0.25)),
+        node_sel:  c(warm),
+        node_selr: c(mix(node, fg, 0.7)),
+        label:     c(dim),
+        label_hov: c(fg),
+        bar_bg:    c(bar_bg),
+        bar_line:  c(mix(bar_bg, fg, 0.2)),
+        bar_text:  c(bar_fg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +327,48 @@ mod tests {
                 assert!(contrast(c, bg) >= 3.0, "{}: slot {s} {c:?} contrast {:.2}", t.name, contrast(c, bg));
                 assert_eq!(c, palette(bg)[s as usize]);
             }
+        }
+    }
+
+    fn rgb(c: Color32) -> [u8; 3] { [c.r(), c.g(), c.b()] }
+
+    #[test]
+    fn emacs_theme_takes_the_faces_it_can_read() {
+        use navi_core::bridge::Palette;
+        let p = Palette {
+            bg: Some([16, 30, 46]), fg: Some([224, 240, 255]), link: Some([85, 120, 255]),
+            accent: Some([64, 232, 255]), warm: Some([240, 144, 48]), dim: Some([120, 152, 184]),
+            bar_bg: Some([10, 28, 52]), bar_fg: Some([168, 200, 216]),
+        };
+        let t = from_emacs(&p);
+        assert_eq!(rgb(t.bg), [16, 30, 46]);
+        assert_eq!(rgb(t.node), [85, 120, 255]);
+        assert_eq!(rgb(t.edge_hi), [64, 232, 255]);
+        assert_eq!(rgb(t.node_sel), [240, 144, 48]);
+        assert_eq!(rgb(t.bar_bg), [10, 28, 52]);
+    }
+
+    /// Whatever Emacs sends (nothing, a link colour equal to the background,
+    /// a light theme), nodes, labels and the status text stay readable.
+    #[test]
+    fn emacs_theme_is_always_readable() {
+        use navi_core::bridge::Palette;
+        use navi_core::groups::contrast;
+        let cases = [
+            Palette::default(),
+            Palette { bg: Some([255, 255, 255]), fg: Some([0, 0, 0]), ..Default::default() },
+            Palette { bg: Some([250, 250, 245]), fg: Some([60, 60, 60]), link: Some([250, 250, 240]), accent: Some([255, 255, 0]), ..Default::default() },
+            Palette { bg: Some([0, 0, 0]), fg: Some([5, 5, 5]), link: Some([0, 0, 10]), bar_bg: Some([0, 0, 0]), bar_fg: Some([0, 0, 0]), ..Default::default() },
+            // stock Emacs: a light grey mode line, here on a dark canvas with no mode-line foreground
+            Palette { bg: Some([30, 30, 30]), fg: Some([220, 220, 220]), bar_bg: Some([191, 191, 191]), ..Default::default() },
+        ];
+        for p in cases {
+            let t = from_emacs(&p);
+            let bg = rgb(t.bg);
+            for (what, c, min) in [("node", t.node, 3.0), ("selected", t.node_sel, 3.0), ("label", t.label, 2.5), ("label_hov", t.label_hov, 4.5), ("edge_hi", t.edge_hi, 3.0)] {
+                assert!(contrast(rgb(c), bg) >= min, "{p:?}: {what} {:?} on {bg:?}", rgb(c));
+            }
+            assert!(contrast(rgb(t.bar_text), rgb(t.bar_bg)) >= 3.0, "{p:?}: status text");
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod community;
 pub mod config;
 pub mod db;

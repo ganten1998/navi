@@ -33,7 +33,7 @@ pub struct PanelState {
     pub rename_focus:   bool,           // give the rename field the keyboard the frame it opens
     pub confirm_delete: bool,           // "Delete view?" asked inline
     pub drag_from:      Option<usize>,  // manual group row being dragged by its handle
-    autos:              Option<((u64, usize), Vec<AutoRow>)>, // the automatic groups list, per (view_gen, theme)
+    pub(super) autos:   Option<((u64, usize), Vec<AutoRow>)>, // the automatic groups list, per (view_gen, theme)
 }
 
 /// One row of the automatic groups list, built once per recompute.

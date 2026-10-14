@@ -1,6 +1,6 @@
 # Navi
 
-An interactive graph viewer for [org-roam](https://www.orgroam.com/), running as a native desktop window. No Emacs package required: Navi reads your `org-roam.db` directly and opens nodes in your existing Emacs process via `emacsclient`.
+An interactive graph viewer for [org-roam](https://www.orgroam.com/), running as a native desktop window. Use it from Emacs with the small `org-roam-navi` package (the graph follows the note you're in, and opens nodes in that Emacs), or on its own: Navi reads your `org-roam.db` directly and opens nodes in your running Emacs via `emacsclient`.
 
 Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https://github.com/grovesNL/glow) (OpenGL). On macOS it ships a hand-rolled vsync-aligned event loop that locks the renderer to the panel's native refresh rate (60, 120, 240 Hz) with sub-millisecond frame time variance, then drops to ~30 fps when idle to save power on laptops.
 
@@ -10,7 +10,71 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 - **macOS**: primary target, fully supported. Tested on Apple Silicon (M-series) at 60 / 120 / 240 Hz. A pre-built `Navi.app` ships with each release.
 - **Linux**: supported, X11 and Wayland backends both built in (one binary; X11 is picked automatically under i3 and other X11 WMs). Vsync pacing via blocking `SwapInterval::Wait(1)` swaps on X11, and a refresh-rate timer on Wayland. Sets `WM_CLASS` / `app_id` to `navi` for window-manager rules. Pre-built x86_64 and aarch64 glibc binaries ship with each release.
+- **FreeBSD**: supported (x86_64, FreeBSD 14 or later, X11). Pre-built binaries ship with each release. They are cross-built, and the same code paths as Linux/X11.
 - **Windows**: supported. Talks to the Emacs server over its native TCP `server-file` mechanism, finds `emacsclientw.exe` across the official installer / Chocolatey / Scoop / MSYS2 layouts, and builds as a GUI-subsystem app (no console window). A pre-built x64 exe ships with each release.
+
+---
+
+## In Emacs
+
+Two lines in your init and Navi is part of Emacs:
+
+```elisp
+(use-package org-roam-navi
+  :vc (:url "https://codeberg.org/ganten1998/navi" :lisp-dir "emacs")
+  :after org-roam
+  :bind ("C-c n g" . org-roam-navi))
+```
+
+Then `C-c n g` (or `M-x org-roam-navi`). The first time, it offers to download the right Navi for your machine from the [Releases](https://codeberg.org/ganten1998/navi/releases) page (checked against the release's `SHA256SUMS`), so there is nothing else to install. After that:
+
+- **The graph follows you.** The note or heading at point is selected and the view glides to it. Turn on local-graph mode (`L` in Navi) and you always see the neighbourhood of what you're writing.
+- **Nodes open in this Emacs.** Double-click a node (or `Enter`) and it opens in the window you were last in, at the heading. No `server-start`, no emacsclient path, no sockets: Navi talks to the Emacs that started it over a pipe.
+- **It wears your theme.** Navi draws with your Emacs colours (canvas from `default`, nodes in your `org-link` colour, the status bar from the mode line) and follows `load-theme`. `T` still cycles Navi's own themes.
+- **It stays current.** Navi re-reads the database whenever org-roam writes it.
+- **It goes when Emacs goes.**
+
+Running `org-roam-navi` again brings the window to the front. Works the same from GUI frames and terminal frames (`emacsclient -t`), on macOS, Linux, Windows and FreeBSD.
+
+| Command | |
+|---|---|
+| `org-roam-navi` | Open the graph, or raise it |
+| `org-roam-navi-quit` | Close it |
+| `org-roam-navi-install` | Download the latest Navi (replaces the downloaded one) |
+| `org-roam-navi-update` | The same, only when a newer release exists |
+
+| Option | Default | |
+|---|---|---|
+| `org-roam-navi-program` | `nil` | Navi to run. `nil`: the downloaded copy, then `Navi.app` in `/Applications` on macOS |
+| `org-roam-navi-follow` | `t` | Follow the node at point |
+| `org-roam-navi-follow-delay` | `0.25` | Idle seconds before following |
+| `org-roam-navi-sync-theme` | `t` | Draw with the Emacs theme |
+| `org-roam-navi-display-function` | `pop-to-buffer-same-window` | How an opened note is shown |
+| `org-roam-navi-install-directory` | `~/.emacs.d/org-roam-navi/` | Where the download goes |
+
+`org-roam-navi-open-hook` runs in a note's buffer after the graph opens it. Navi's stderr goes to the `*navi-log*` buffer.
+
+<details>
+<summary>Emacs 29, straight, elpaca, Doom</summary>
+
+```elisp
+;; Emacs 29 (package-vc)
+(package-vc-install '(org-roam-navi :url "https://codeberg.org/ganten1998/navi" :lisp-dir "emacs"))
+
+;; straight.el
+(straight-use-package '(org-roam-navi :type git :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+
+;; elpaca
+(elpaca (org-roam-navi :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+
+;; Doom: packages.el
+(package! org-roam-navi :recipe (:host nil :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+```
+
+Or copy `emacs/org-roam-navi.el` onto your `load-path` and `(require 'org-roam-navi)`.
+</details>
+
+Under the hood, `org-roam-navi` starts `navi --emacs --db <org-roam-db-location>` and the two exchange JSON lines (protocol in `navi-core/src/bridge.rs`). Navi also runs on its own, as below; config.json is shared, and `--db` doesn't change it.
 
 ---
 
@@ -22,6 +86,7 @@ All from the [Releases](https://codeberg.org/ganten1998/navi/releases) page:
 
 - **macOS (Apple Silicon, macOS 14 or later)**: `Navi-<version>-arm64.zip`: unzip, double-click `Navi.app`. The app is signed with a Developer ID and notarized by Apple, so it opens like any downloaded app.
 - **Linux**: `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL, present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).
+- **FreeBSD (x86_64)**: `navi-<version>-freebsd-x86_64.tar.gz`: unpack, run `./navi`. Needs X11 and Mesa: `pkg install libX11 libxkbcommon libXcursor libXrandr libXi mesa-libs mesa-dri` (all present on a desktop install).
 - **Windows (x64)**: `navi-<version>-windows-x86_64.zip`: unzip, run `navi.exe`.
 
 ### From source
@@ -49,7 +114,7 @@ On first run, Navi auto-detects your `org-roam.db` and creates `~/.config/navi/c
 
 - **Rust 1.75+** (stable), install via [rustup](https://rustup.rs/) (source builds only)
 - **org-roam v2** database (`nodes`, `files`, `links`, `tags`, `aliases`)
-- **emacsclient** + a running Emacs server (`(server-start)` in your init), for double-click-to-open. On Windows the server runs in TCP mode automatically; nothing extra to configure.
+- To open nodes when Navi runs on its own: **emacsclient** + a running Emacs server (`(server-start)` in your init). On Windows the server runs in TCP mode automatically; nothing extra to configure. Started from Emacs by `org-roam-navi`, Navi needs neither.
 - A working OpenGL (or GLES) context, built into macOS, standard on Linux (Mesa) and Windows
 
 ---
@@ -213,6 +278,8 @@ Operators are upper case (`and`, `or`, `not` are ordinary words). Plain text sta
 
 Double-click a node (or select it and press `Enter` / `Space`). File nodes open the file; **headline nodes jump to the heading** via `goto-char`.
 
+Started by [`org-roam-navi`](#in-emacs), Navi hands the node to that Emacs over its pipe and nothing below applies. On its own, it uses emacsclient:
+
 GUI apps get a minimal `PATH`, so Navi resolves `emacsclient` to an absolute path itself and locates the running server:
 
 - Unix (socket): `$EMACS_SOCKET_NAME` / `$EMACS_SERVER_SOCKET`, `$XDG_RUNTIME_DIR/emacs/`, `$TMPDIR/emacs{uid}/`, `/tmp`, `/private/tmp` (covers the macOS GUI-vs-Terminal `TMPDIR` mismatch)
@@ -235,7 +302,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | Double-click node | Open in Emacs |
 | `Tab` / `Shift-Tab` | Cycle visible nodes |
 | `Enter` / `Space` | Open selected node |
-| `T` | Cycle colour theme |
+| `T` | Cycle colour theme (started from Emacs, the Emacs theme is one of them) |
 | `G` | Group display on / off (colours, hulls, pull, legend) |
 | `Shift-G` | Cycle the automatic grouper: none → folder → tag → component → community → file |
 | `1` to `9` | Switch to view 1 to 9 |
@@ -247,7 +314,7 @@ If open fails, an error appears in the status bar. Make sure Emacs has `(server-
 | `L` | Cycle local-graph mode (1 → 2 → 3 hops → off) |
 | `V` | Cycle layout algorithm |
 | `/` | Search with the [query language](#query-language); plain words search titles and aliases |
-| `W` | Reload graph from database |
+| `W` | Reload graph from database (Navi also reloads by itself when the db changes on disk) |
 | `F` | Toggle FPS counter |
 | `P` | Pause / resume physics |
 | `R` | Reset view |
@@ -265,6 +332,14 @@ Mouse / keyboard events do **not** trigger paints on any platform: a per-platfor
 - **Linux/Wayland**: swaps never block (compositors stop frame callbacks for hidden surfaces, which would freeze a blocking swap); a `WaitUntil` timer paces at the monitor's reported refresh rate instead. When the window is fully occluded (macOS occlusion state, X11 visibility events) painting stops entirely.
 
 Result on a 240 Hz display (macOS): 4.17 ms average frame interval, worst-case 5–7 ms (no missed vsyncs in steady state), and the application sits near 0 % CPU when idle.
+
+### Command line
+
+| Flag | |
+|---|---|
+| `--db PATH` | Read this org-roam.db, for this run only (config.json keeps its own) |
+| `--emacs` | Started by org-roam-navi.el: commands on stdin, events on stdout, quit at EOF |
+| `-V`, `--version` | Print the version |
 
 ### Diagnostics
 
@@ -289,6 +364,7 @@ navi-core/                Pure-Rust library: config, org-roam DB loader, view pi
   src/config.rs           Config load/save (tolerant, atomic), db detection, path expansion
   src/db.rs               org-roam.db loader: link typing, dedupe, dangling links, containment, properties
   src/emacs.rs            emacsclient + socket discovery
+  src/bridge.rs           The --emacs protocol (JSON lines with org-roam-navi.el)
   src/view.rs             Dailies / group / orphan filters → visible nodes + edges, orphan counts
   src/query.rs            The query language: lexer, parser, evaluator
   src/groups.rs           Manual + automatic groups, precedence, hiding, stable colours, hulls
@@ -305,7 +381,9 @@ navi/                     Binary: UI, rendering, event loop
   src/macos_display.rs    macOS CADisplayLink + tier control
   src/theme.rs            Colour themes
 scripts/build-macos.sh    Cargo build + Navi.app, Developer ID signing, notarization, zip for release
-scripts/build-cross.sh    Linux (zig) and Windows (cargo-xwin, needs Homebrew llvm) release builds
+scripts/build-cross.sh    Linux + FreeBSD (zig) and Windows (cargo-xwin, needs Homebrew llvm) release builds, SHA256SUMS
+emacs/org-roam-navi.el    The Emacs package: start, follow, theme, open, download
+emacs/test/               ERT tests (a fake navi speaks the protocol)
 assets/icon.png           App icon (bundle icns is generated from this)
 assets/navi.desktop       Linux desktop entry (shipped in the Linux tarball)
 ```
@@ -323,6 +401,12 @@ cargo build
 
 # macOS .app bundle + release zip
 ./scripts/build-macos.sh
+```
+
+Tests: `cargo test --workspace` for Navi, and for the Emacs package (org-roam must be loadable):
+
+```bash
+emacs -Q --batch --eval '(package-initialize)' -L emacs -l emacs/test/org-roam-navi-test.el -f ert-run-tests-batch-and-exit
 ```
 
 The release profile in the workspace has `lto = true` and `opt-level = 3`. Expect a 30–60 s clean release build on a modern laptop.
