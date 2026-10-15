@@ -4,7 +4,7 @@
 
 ;; Author: Matthew Gantenbein
 ;; URL: https://codeberg.org/ganten1998/navi
-;; Version: 1.2.0
+;; Package-Version: 1.2.0
 ;; Package-Requires: ((emacs "28.1") (org-roam "2.2"))
 ;; Keywords: outlines, hypermedia, convenience
 
