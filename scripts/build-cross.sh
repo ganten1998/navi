@@ -61,9 +61,12 @@ package_unix() { # $1 = rust target, $2 = os name in the artifact, $3 = arch nam
   cp "$TARGET_DIR/${target}/release/navi" "$stage/"
   cp assets/navi.desktop "$stage/"
   cp assets/icon.png "$stage/"
+  # dist/ is in Dropbox, whose files come out 0600: set the modes a system-wide
+  # install needs, and ship no build-machine owner
+  chmod 755 "$stage" "$stage/navi"; chmod 644 "$stage/navi.desktop" "$stage/icon.png"
   # dist/ is in Dropbox: the files carry com.apple.provenance and Dropbox
   # xattrs, which macOS tar would ship as AppleDouble ._ files
-  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C dist -czf "${stage}.tar.gz" "navi-${VERSION}-${os}-${arch}"
+  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname root -C dist -czf "${stage}.tar.gz" "navi-${VERSION}-${os}-${arch}"
   rm -rf "$stage"
   echo "==> ${stage}.tar.gz"
 }
@@ -78,7 +81,9 @@ echo "==> Navi $VERSION: FreeBSD x86_64"
 package_unix x86_64-unknown-freebsd freebsd x86_64 x86_64-unknown-freebsd
 
 echo "==> Navi $VERSION: Windows x86_64"
-cargo xwin build --release --target x86_64-pc-windows-msvc -p navi
+# static CRT: a clean Windows has no VCRUNTIME140.dll (the VC++ redistributable)
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo xwin build --release --target x86_64-pc-windows-msvc -p navi
 rm -f "dist/navi-${VERSION}-windows-x86_64.zip"
 (cd "$TARGET_DIR/x86_64-pc-windows-msvc/release" && zip -q "$ROOT/dist/navi-${VERSION}-windows-x86_64.zip" navi.exe)
 echo "==> dist/navi-${VERSION}-windows-x86_64.zip"

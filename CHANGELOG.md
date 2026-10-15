@@ -2,6 +2,22 @@
 
 All notable changes to Navi are documented here.
 
+## [1.2.1] - 2026-10-14
+
+### Fixed
+
+- Windows: the exe links the C runtime statically, so it starts on a
+  Windows without the Visual C++ redistributable (1.2.0 needed
+  `VCRUNTIME140.dll`).
+- org-roam-navi: a release without `SHA256SUMS` (an old one, served by a
+  fallback host) is skipped instead of offered, and `org-roam-navi-update`
+  compares versions, so it never installs an older Navi. The installed
+  directory is readable (0755, was 0700).
+- Linux and FreeBSD tarballs: `navi.desktop` and `icon.png` are 0644 (were
+  0600) and the files carry no build-machine owner.
+- package-vc no longer byte-compiles the package's tests into your elpa.
+- README: the macOS download is the universal zip (Apple Silicon and Intel).
+
 ## [1.2.0] - 2026-10-14
 
 ### Added
@@ -28,7 +44,7 @@ All notable changes to Navi are documented here.
 - Navi re-reads the db by itself when it changes on disk (the db or its
   `-wal`), quietly: the status bar only reports a change in the nodes.
 - **FreeBSD** release build (x86_64, cross-built with zig).
-- Releases carry `SHA256SUMS`, on GitHub (ganten1998/navi) and Codeberg.
+- Releases carry `SHA256SUMS`.
 
 ## [1.1.0] - 2026-10-12
 

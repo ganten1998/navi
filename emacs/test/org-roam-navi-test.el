@@ -245,19 +245,41 @@ previous install in place.  Returns (TMP INSTALL-DIR ERROR)."
       (delete-directory tmp t))))
 
 (ert-deftest org-roam-navi-test-release-falls-back ()
-  ;; the first host is down, the second has no build for us, the third does
-  (let* ((org-roam-navi-release-urls '("down" "empty" "good"))
+  ;; the first host is down, the second has no build for us, the third an
+  ;; old one with no checksums, the fourth a good one
+  (let* ((org-roam-navi-release-urls '("down" "empty" "old" "good"))
          (system-type 'gnu/linux) (system-configuration "x86_64-pc-linux-gnu")
-         (good (list :tag_name "v9" :assets (list (list :name "navi-9-linux-x86_64.tar.gz")))))
+         (good (list :tag_name "v9" :assets (list (list :name "navi-9-linux-x86_64.tar.gz")
+                                                  (list :name "SHA256SUMS")))))
     (cl-letf (((symbol-function 'org-roam-navi--fetch-json)
                (lambda (url)
                  (pcase url
                    ("down" (user-error "unreachable"))
                    ("empty" (list :tag_name "v8" :assets (list (list :name "navi-8-windows-x86_64.zip"))))
+                   ("old" (list :tag_name "v1.0.0" :assets (list (list :name "navi-1.0.0-linux-x86_64.tar.gz"))))
                    ("good" good)))))
       (should (eq (org-roam-navi--latest-release) good)))
     (cl-letf (((symbol-function 'org-roam-navi--fetch-json) (lambda (_) (user-error "unreachable"))))
       (let ((err (should-error (org-roam-navi--latest-release) :type 'user-error)))
         (should (string-match-p "down: unreachable" (cadr err)))))))
+
+(ert-deftest org-roam-navi-test-update-never-downgrades ()
+  (let* ((tmp (make-temp-file "navi-update" t))
+         (org-roam-navi-install-directory tmp)
+         installed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-roam-navi-install) (lambda () (setq installed t)))
+                  ((symbol-function 'org-roam-navi--latest-release) (lambda () (list :tag_name latest))))
+          (dolist (case '(("v1.2.1" "v1.2.0" nil) ("v1.2.1" "v1.2.1" nil)
+                          ("v1.2.0" "v1.2.1" t) ("v1.2.1" "v1.10.0" t) (nil "v1.2.1" t)))
+            (pcase-let ((`(,have ,latest ,want) case))
+              (setq installed nil)
+              (let ((f (expand-file-name "VERSION" tmp)))
+                (if have (with-temp-file f (insert have "\n")) (when (file-exists-p f) (delete-file f))))
+              (defvar latest)
+              (let ((latest latest))
+                (org-roam-navi-update))
+              (should (eq installed want)))))
+      (delete-directory tmp t))))
 
 ;;; org-roam-navi-test.el ends here

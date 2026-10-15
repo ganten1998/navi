@@ -4,7 +4,7 @@
 
 ;; Author: Matthew Gantenbein
 ;; URL: https://codeberg.org/ganten1998/navi
-;; Version: 1.2.0
+;; Version: 1.2.1
 ;; Package-Requires: ((emacs "28.1") (org-roam "2.2"))
 ;; Keywords: outlines, hypermedia, convenience
 
@@ -347,12 +347,18 @@ machine is used.  GitHub and Codeberg (Forgejo) answer alike."
     (or (seq-some
          (lambda (url)
            (condition-case err
-               (let ((release (org-roam-navi--fetch-json url)))
-                 (if (seq-find (lambda (a) (org-roam-navi--asset-p (plist-get a :name)))
-                               (plist-get release :assets))
-                     release
+               (let* ((release (org-roam-navi--fetch-json url))
+                      (names (mapcar (lambda (a) (plist-get a :name)) (plist-get release :assets))))
+                 (cond
+                  ((not (seq-find #'org-roam-navi--asset-p names))
                    (push (format "%s: no download for %s" url system-configuration) errors)
-                   nil))
+                   nil)
+                  ;; a release that can't be checked (older Navis had no
+                  ;; SHA256SUMS) is passed over, not offered as a downgrade
+                  ((not (member "SHA256SUMS" names))
+                   (push (format "%s: %s has no SHA256SUMS" url (plist-get release :tag_name)) errors)
+                   nil)
+                  (t release)))
              (error (push (format "%s: %s" url (error-message-string err)) errors) nil)))
          org-roam-navi-release-urls)
         (user-error "Navi: no release found (%s)"
@@ -440,7 +446,9 @@ It goes to `org-roam-navi-install-directory', replacing any older copy."
                           (null (directory-files dir nil directory-files-no-dot-files-regexp)))
                 (error "Navi: %s holds files this package didn't put there; set `org-roam-navi-install-directory' to an empty directory" dir))
               (delete-directory dir t))
-            (rename-file stage (directory-file-name dir)))
+            (rename-file stage (directory-file-name dir))
+            ;; make-temp-file made the stage private
+            (set-file-modes dir #o755))
         (when (file-directory-p stage) (delete-directory stage t))
         (delete-file sums-file)
         (delete-file archive)))
@@ -455,10 +463,14 @@ It goes to `org-roam-navi-install-directory', replacing any older copy."
   (let* ((file (expand-file-name "VERSION" org-roam-navi-install-directory))
          (have (and (file-exists-p file)
                     (string-trim (with-temp-buffer (insert-file-contents file) (buffer-string)))))
-         (latest (plist-get (org-roam-navi--latest-release) :tag_name)))
-    (if (equal have latest)
-        (message "Navi %s is the latest" have)
-      (org-roam-navi-install))))
+         (latest (plist-get (org-roam-navi--latest-release) :tag_name))
+         (num (lambda (tag) (ignore-errors (version-to-list (string-remove-prefix "v" tag))))))
+    (cond ((null have) (org-roam-navi-install))
+          ((and (funcall num have) (funcall num latest)
+                (not (version-list-< (funcall num have) (funcall num latest))))
+           (message "Navi %s is the latest" have))
+          ((equal have latest) (message "Navi %s is the latest" have))
+          (t (org-roam-navi-install)))))
 
 
 ;;;; Commands
