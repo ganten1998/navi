@@ -35,7 +35,7 @@
 ;; Install (Emacs 30):
 ;;
 ;;   (use-package org-roam-navi
-;;     :vc (:url "https://codeberg.org/ganten1998/navi" :lisp-dir "emacs")
+;;     :vc (:url "https://codeberg.org/ganten1998/navi")
 ;;     :after org-roam
 ;;     :bind ("C-c n g" . org-roam-navi))
 ;;

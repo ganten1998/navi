@@ -1,7 +1,7 @@
 ;;; org-roam-navi-test.el --- Tests for org-roam-navi -*- lexical-binding: t; -*-
 
 ;; Run from the repo root:
-;;   emacs -Q --batch -L emacs -l emacs/test/org-roam-navi-test.el -f ert-run-tests-batch-and-exit
+;;   emacs -Q --batch -L . -l emacs/test/org-roam-navi-test.el -f ert-run-tests-batch-and-exit
 ;; (org-roam must be loadable, e.g. add (package-initialize) with your elpa dir.)
 
 ;;; Code:

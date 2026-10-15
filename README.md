@@ -21,7 +21,7 @@ Two lines in your init and Navi is part of Emacs:
 
 ```elisp
 (use-package org-roam-navi
-  :vc (:url "https://codeberg.org/ganten1998/navi" :lisp-dir "emacs")
+  :vc (:url "https://codeberg.org/ganten1998/navi")
   :after org-roam
   :bind ("C-c n g" . org-roam-navi))
 ```
@@ -59,19 +59,19 @@ Running `org-roam-navi` again brings the window to the front. Works the same fro
 
 ```elisp
 ;; Emacs 29 (package-vc)
-(package-vc-install '(org-roam-navi :url "https://codeberg.org/ganten1998/navi" :lisp-dir "emacs"))
+(package-vc-install '(org-roam-navi :url "https://codeberg.org/ganten1998/navi"))
 
 ;; straight.el
-(straight-use-package '(org-roam-navi :type git :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+(straight-use-package '(org-roam-navi :type git :repo "https://codeberg.org/ganten1998/navi" :files ("org-roam-navi.el")))
 
 ;; elpaca
-(elpaca (org-roam-navi :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+(elpaca (org-roam-navi :repo "https://codeberg.org/ganten1998/navi" :files ("org-roam-navi.el")))
 
 ;; Doom: packages.el
-(package! org-roam-navi :recipe (:host nil :repo "https://codeberg.org/ganten1998/navi" :files ("emacs/*.el")))
+(package! org-roam-navi :recipe (:host nil :repo "https://codeberg.org/ganten1998/navi" :files ("org-roam-navi.el")))
 ```
 
-Or copy `emacs/org-roam-navi.el` onto your `load-path` and `(require 'org-roam-navi)`.
+Or copy `org-roam-navi.el` onto your `load-path` and `(require 'org-roam-navi)`.
 </details>
 
 Under the hood, `org-roam-navi` starts `navi --emacs --db <org-roam-db-location>` and the two exchange JSON lines (protocol in `navi-core/src/bridge.rs`). Navi also runs on its own, as below; config.json is shared, and `--db` doesn't change it.
@@ -382,7 +382,7 @@ navi/                     Binary: UI, rendering, event loop
   src/theme.rs            Colour themes
 scripts/build-macos.sh    Cargo build + Navi.app, Developer ID signing, notarization, zip for release
 scripts/build-cross.sh    Linux + FreeBSD (zig) and Windows (cargo-xwin, needs Homebrew llvm) release builds, SHA256SUMS
-emacs/org-roam-navi.el    The Emacs package: start, follow, theme, open, download
+org-roam-navi.el          The Emacs package: start, follow, theme, open, download (at the root so package-vc finds it)
 emacs/test/               ERT tests (a fake navi speaks the protocol)
 assets/icon.png           App icon (bundle icns is generated from this)
 assets/navi.desktop       Linux desktop entry (shipped in the Linux tarball)
@@ -406,7 +406,7 @@ cargo build
 Tests: `cargo test --workspace` for Navi, and for the Emacs package (org-roam must be loadable):
 
 ```bash
-emacs -Q --batch --eval '(package-initialize)' -L emacs -l emacs/test/org-roam-navi-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch --eval '(package-initialize)' -L . -l emacs/test/org-roam-navi-test.el -f ert-run-tests-batch-and-exit
 ```
 
 The release profile in the workspace has `lto = true` and `opt-level = 3`. Expect a 30–60 s clean release build on a modern laptop.

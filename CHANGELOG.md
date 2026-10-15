@@ -6,7 +6,7 @@ All notable changes to Navi are documented here.
 
 ### Added
 
-- **Navi in Emacs: `org-roam-navi`** (`emacs/org-roam-navi.el`). One
+- **Navi in Emacs: `org-roam-navi`** (`org-roam-navi.el`). One
   `use-package` form, then `M-x org-roam-navi`: the first run downloads the
   right Navi for the machine from the latest release and checks it against
   `SHA256SUMS`. Started that way:
