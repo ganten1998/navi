@@ -17,7 +17,7 @@ Written in Rust on top of [egui](https://github.com/emilk/egui) + [glow](https:/
 
 ## In Emacs
 
-One form in your init and Navi is part of Emacs:
+One form in your init (Emacs 30 or later; Emacs 28 and 29 below) and Navi is part of Emacs:
 
 ```elisp
 (use-package org-roam-navi
@@ -55,7 +55,7 @@ Running `org-roam-navi` again brings the window to the front. Works the same fro
 `org-roam-navi-open-hook` runs in a note's buffer after the graph opens it. Navi's stderr goes to the `*navi-log*` buffer.
 
 <details>
-<summary>Emacs 29, straight, elpaca, Doom</summary>
+<summary>Emacs 28 and 29, straight, elpaca, Doom</summary>
 
 ```elisp
 ;; Emacs 29 (package-vc)
@@ -71,7 +71,7 @@ Running `org-roam-navi` again brings the window to the front. Works the same fro
 (package! org-roam-navi :recipe (:host nil :repo "https://codeberg.org/ganten1998/navi" :files ("org-roam-navi.el")))
 ```
 
-Or copy `org-roam-navi.el` onto your `load-path` and `(require 'org-roam-navi)`.
+On Emacs 28, or anywhere: copy `org-roam-navi.el` onto your `load-path` and `(require 'org-roam-navi)`.
 </details>
 
 Under the hood, `org-roam-navi` starts `navi --emacs --db <org-roam-db-location>` and the two exchange JSON lines (protocol in `navi-core/src/bridge.rs`). Navi also runs on its own, as below; config.json is shared, and `--db` doesn't change it.
