@@ -28,7 +28,7 @@ All notable changes to Navi are documented here.
 - Navi re-reads the db by itself when it changes on disk (the db or its
   `-wal`), quietly: the status bar only reports a change in the nodes.
 - **FreeBSD** release build (x86_64, cross-built with zig).
-- Releases carry `SHA256SUMS`.
+- Releases carry `SHA256SUMS`, on GitHub (ganten1998/navi) and Codeberg.
 
 ## [1.1.0] - 2026-10-12
 

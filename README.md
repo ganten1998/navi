@@ -25,7 +25,7 @@ Two lines in your init and Navi is part of Emacs:
   :bind ("C-c n g" . org-roam-navi))
 ```
 
-Then `C-c n g` (or `M-x org-roam-navi`). The first time, it offers to download the right Navi for your machine from the [Releases](https://codeberg.org/ganten1998/navi/releases) page (checked against the release's `SHA256SUMS`), so there is nothing else to install. After that:
+Then `C-c n g` (or `M-x org-roam-navi`). The first time, it offers to download the right Navi for your machine from the [Releases](https://github.com/ganten1998/navi/releases) page (GitHub, falling back to Codeberg; checked against the release's `SHA256SUMS`), so there is nothing else to install. After that:
 
 - **The graph follows you.** The note or heading at point is selected and the view glides to it. Turn on local-graph mode (`L` in Navi) and you always see the neighbourhood of what you're writing.
 - **Nodes open in this Emacs.** Double-click a node (or `Enter`) and it opens in the window you were last in, at the heading. No `server-start`, no emacsclient path, no sockets: Navi talks to the Emacs that started it over a pipe.
@@ -50,6 +50,7 @@ Running `org-roam-navi` again brings the window to the front. Works the same fro
 | `org-roam-navi-sync-theme` | `t` | Draw with the Emacs theme |
 | `org-roam-navi-display-function` | `pop-to-buffer-same-window` | How an opened note is shown |
 | `org-roam-navi-install-directory` | `~/.emacs.d/org-roam-navi/` | Where the download goes |
+| `org-roam-navi-release-urls` | GitHub, then Codeberg | Release APIs to download from, in order |
 
 `org-roam-navi-open-hook` runs in a note's buffer after the graph opens it. Navi's stderr goes to the `*navi-log*` buffer.
 
@@ -81,7 +82,7 @@ Under the hood, `org-roam-navi` starts `navi --emacs --db <org-roam-db-location>
 
 ### Pre-built binaries
 
-All from the [Releases](https://codeberg.org/ganten1998/navi/releases) page:
+All from the [Releases](https://github.com/ganten1998/navi/releases) page (also on [Codeberg](https://codeberg.org/ganten1998/navi/releases), where the source lives):
 
 - **macOS (Apple Silicon, macOS 14 or later)**: `Navi-<version>-arm64.zip`: unzip, double-click `Navi.app`. The app is signed with a Developer ID and notarized by Apple, so it opens like any downloaded app.
 - **Linux**: `navi-<version>-linux-x86_64.tar.gz` / `navi-<version>-linux-aarch64.tar.gz`: unpack, run `./navi`. Needs glibc ≥ 2.32 (musl-based distros need a source build) and the usual X11/GL runtime libs (`libX11`, `libxkbcommon`, `libxkbcommon-x11`, Mesa/libGL, present on any desktop install; on a minimal Void install: `xbps-install libxkbcommon mesa-dri`). The tarball includes `navi.desktop` + icon for launcher integration (`cp navi ~/.local/bin/ && cp navi.desktop ~/.local/share/applications/ && cp icon.png ~/.local/share/icons/hicolor/1024x1024/apps/navi.png`).

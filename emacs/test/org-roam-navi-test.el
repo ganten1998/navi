@@ -244,4 +244,20 @@ previous install in place.  Returns (TMP INSTALL-DIR ERROR)."
                          "v9.9.9\n")))
       (delete-directory tmp t))))
 
+(ert-deftest org-roam-navi-test-release-falls-back ()
+  ;; the first host is down, the second has no build for us, the third does
+  (let* ((org-roam-navi-release-urls '("down" "empty" "good"))
+         (system-type 'gnu/linux) (system-configuration "x86_64-pc-linux-gnu")
+         (good (list :tag_name "v9" :assets (list (list :name "navi-9-linux-x86_64.tar.gz")))))
+    (cl-letf (((symbol-function 'org-roam-navi--fetch-json)
+               (lambda (url)
+                 (pcase url
+                   ("down" (user-error "unreachable"))
+                   ("empty" (list :tag_name "v8" :assets (list (list :name "navi-8-windows-x86_64.zip"))))
+                   ("good" good)))))
+      (should (eq (org-roam-navi--latest-release) good)))
+    (cl-letf (((symbol-function 'org-roam-navi--fetch-json) (lambda (_) (user-error "unreachable"))))
+      (let ((err (should-error (org-roam-navi--latest-release) :type 'user-error)))
+        (should (string-match-p "down: unreachable" (cadr err)))))))
+
 ;;; org-roam-navi-test.el ends here

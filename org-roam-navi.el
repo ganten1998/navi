@@ -4,7 +4,7 @@
 
 ;; Author: Matthew Gantenbein
 ;; URL: https://codeberg.org/ganten1998/navi
-;; Package-Version: 1.2.0
+;; Version: 1.2.0
 ;; Package-Requires: ((emacs "28.1") (org-roam "2.2"))
 ;; Keywords: outlines, hypermedia, convenience
 
@@ -91,10 +91,13 @@ Called with the note's buffer, in the window that was selected last."
   "Where `org-roam-navi-install' puts Navi."
   :type 'directory)
 
-(defcustom org-roam-navi-release-url
-  "https://codeberg.org/api/v1/repos/ganten1998/navi/releases/latest"
-  "The API address of Navi's latest release."
-  :type 'string)
+(defcustom org-roam-navi-release-urls
+  '("https://api.github.com/repos/ganten1998/navi/releases/latest"
+    "https://codeberg.org/api/v1/repos/ganten1998/navi/releases/latest")
+  "API addresses of Navi's latest release, tried in order.
+The first that answers with a release holding a download for this
+machine is used.  GitHub and Codeberg (Forgejo) answer alike."
+  :type '(repeat string))
 
 (defvar org-roam-navi-open-hook nil
   "Run after a node opened from the graph is shown, in its buffer.")
@@ -338,6 +341,23 @@ Called with the note's buffer, in the window that was selected last."
               (json-read)))
         (kill-buffer buf)))))
 
+(defun org-roam-navi--latest-release ()
+  "The latest release with a download for this machine, as a plist."
+  (let (errors)
+    (or (seq-some
+         (lambda (url)
+           (condition-case err
+               (let ((release (org-roam-navi--fetch-json url)))
+                 (if (seq-find (lambda (a) (org-roam-navi--asset-p (plist-get a :name)))
+                               (plist-get release :assets))
+                     release
+                   (push (format "%s: no download for %s" url system-configuration) errors)
+                   nil))
+             (error (push (format "%s: %s" url (error-message-string err)) errors) nil)))
+         org-roam-navi-release-urls)
+        (user-error "Navi: no release found (%s)"
+                    (string-join (nreverse errors) "; ")))))
+
 (defun org-roam-navi--sha256 (file)
   "FILE's SHA-256 in hex."
   (with-temp-buffer
@@ -371,7 +391,7 @@ It goes to `org-roam-navi-install-directory', replacing any older copy."
   (interactive)
   (require 'url)
   (message "Navi: looking up the latest release...")
-  (let* ((release (org-roam-navi--fetch-json org-roam-navi-release-url))
+  (let* ((release (org-roam-navi--latest-release))
          (tag (plist-get release :tag_name))
          (assets (plist-get release :assets))
          (asset (seq-find (lambda (a) (org-roam-navi--asset-p (plist-get a :name))) assets))
@@ -435,7 +455,7 @@ It goes to `org-roam-navi-install-directory', replacing any older copy."
   (let* ((file (expand-file-name "VERSION" org-roam-navi-install-directory))
          (have (and (file-exists-p file)
                     (string-trim (with-temp-buffer (insert-file-contents file) (buffer-string)))))
-         (latest (plist-get (org-roam-navi--fetch-json org-roam-navi-release-url) :tag_name)))
+         (latest (plist-get (org-roam-navi--latest-release) :tag_name)))
     (if (equal have latest)
         (message "Navi %s is the latest" have)
       (org-roam-navi-install))))
@@ -447,7 +467,7 @@ It goes to `org-roam-navi-install-directory', replacing any older copy."
   "Start Navi under this Emacs."
   (require 'org-roam)
   (let ((program (or (org-roam-navi--program)
-                     (if (y-or-n-p "Navi isn't installed.  Download it from Codeberg (about 10 MB)? ")
+                     (if (y-or-n-p "Navi isn't installed.  Download it (about 10 MB)? ")
                          (progn (org-roam-navi-install)
                                 (org-roam-navi--find-binary org-roam-navi-install-directory))
                        (user-error "Navi isn't installed (M-x org-roam-navi-install)"))))
