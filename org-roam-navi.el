@@ -36,7 +36,6 @@
 ;;
 ;;   (use-package org-roam-navi
 ;;     :vc (:url "https://codeberg.org/ganten1998/navi")
-;;     :after org-roam
 ;;     :bind ("C-c n g" . org-roam-navi))
 ;;
 ;; See the README for Emacs 29, straight, elpaca and Doom.

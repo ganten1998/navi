@@ -22,7 +22,6 @@ Two lines in your init and Navi is part of Emacs:
 ```elisp
 (use-package org-roam-navi
   :vc (:url "https://codeberg.org/ganten1998/navi")
-  :after org-roam
   :bind ("C-c n g" . org-roam-navi))
 ```
 
